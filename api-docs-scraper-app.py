@@ -748,7 +748,6 @@ def main():
                                 if "rag" in st.session_state:
                                     del st.session_state.rag
                                 # Clean slate
-                                import shutil
                                 if Path(CHROMA_DIR).exists():
                                     shutil.rmtree(CHROMA_DIR)
                                 if Path(SCRAPE_CACHE_FILE).exists():
@@ -764,7 +763,6 @@ def main():
                         try:
                             correct_pw = st.secrets.get("ADMIN_PASSWORD", "admin")
                             if admin_pw == correct_pw:
-                                import shutil
                                 if Path(CHROMA_DIR).exists():
                                     shutil.rmtree(CHROMA_DIR)
                                 if Path(SCRAPE_CACHE_FILE).exists():
@@ -774,6 +772,50 @@ def main():
                                 st.error("❌ Wrong password")
                         except Exception as e:
                             st.error(f"Error: {e}")
+                
+                # Diagnostic button - no password required
+                st.divider()
+                if st.button("🔍 Diagnose Crawl", help="Show what was indexed"):
+                    try:
+                        client = chromadb.PersistentClient(path=CHROMA_DIR)
+                        embedding_fn = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+                        collection = client.get_collection(name=COLLECTION_NAME, embedding_function=embedding_fn)
+                        
+                        # Get all metadata
+                        all_data = collection.get(include=["metadatas"])
+                        
+                        # Extract unique URLs and categories
+                        urls = set()
+                        categories = {}
+                        chunk_types = {}
+                        
+                        for meta in all_data["metadatas"]:
+                            url = meta.get("source_url", "")
+                            if url:
+                                urls.add(url)
+                            
+                            cat = meta.get("category", "unknown")
+                            categories[cat] = categories.get(cat, 0) + 1
+                            
+                            ct = meta.get("chunk_type", "unknown")
+                            chunk_types[ct] = chunk_types.get(ct, 0) + 1
+                        
+                        st.success(f"**Unique pages indexed:** {len(urls)}")
+                        
+                        st.write("**Chunk types:**")
+                        for ct, count in sorted(chunk_types.items(), key=lambda x: -x[1]):
+                            st.write(f"- {ct}: {count}")
+                        
+                        st.write("**Top 15 categories:**")
+                        for cat, count in sorted(categories.items(), key=lambda x: -x[1])[:15]:
+                            st.write(f"- `{cat}`: {count} chunks")
+                        
+                        with st.expander("📄 All indexed URLs"):
+                            for url in sorted(urls):
+                                st.write(f"- {url}")
+                                
+                    except Exception as e:
+                        st.error(f"Diagnostic error: {e}")
         
         st.divider()
         

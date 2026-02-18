@@ -293,16 +293,27 @@ def create_chunks(pages, progress_callback=None):
 
 def build_vector_store(chunks, progress_callback=None):
     """Build ChromaDB vector store from chunks."""
-    Path(CHROMA_DIR).mkdir(exist_ok=True)
+    import shutil
     
+    chroma_path = Path(CHROMA_DIR)
+    
+    # Ensure completely clean slate
+    if chroma_path.exists():
+        shutil.rmtree(chroma_path)
+        logger.info(f"Removed existing {CHROMA_DIR}")
+    
+    chroma_path.mkdir(exist_ok=True)
+    
+    # Create fresh client
     client = chromadb.PersistentClient(path=CHROMA_DIR)
     
-    # Delete existing collection
-    try:
-        client.delete_collection(COLLECTION_NAME)
-    except:
-        pass
+    # List and delete any existing collections (belt and suspenders)
+    existing_collections = client.list_collections()
+    for col in existing_collections:
+        logger.info(f"Deleting existing collection: {col.name}")
+        client.delete_collection(col.name)
     
+    # Now create fresh collection
     embedding_fn = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
     
     collection = client.create_collection(
@@ -310,7 +321,9 @@ def build_vector_store(chunks, progress_callback=None):
         embedding_function=embedding_fn
     )
     
-    # Add in batches
+    logger.info(f"Created new collection: {COLLECTION_NAME}")
+    
+    # Add chunks in batches
     batch_size = 50
     total_batches = (len(chunks) + batch_size - 1) // batch_size
     
@@ -334,7 +347,6 @@ def build_vector_store(chunks, progress_callback=None):
             metadatas.append(meta)
         
         collection.add(ids=ids, documents=documents, metadatas=metadatas)
-        logger.info(f"Added batch {i//batch_size + 1}/{total_batches}")
     
     logger.info(f"Vector store built with {collection.count()} chunks")
     return collection

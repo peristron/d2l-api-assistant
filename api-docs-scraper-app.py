@@ -773,8 +773,9 @@ def main():
                         except Exception as e:
                             st.error(f"Error: {e}")
                 
-                # Diagnostic button - no password required
+                # Diagnostic buttons - no password required (read-only)
                 st.divider()
+                
                 if st.button("🔍 Diagnose Crawl", help="Show what was indexed"):
                     try:
                         client = chromadb.PersistentClient(path=CHROMA_DIR)
@@ -816,6 +817,76 @@ def main():
                                 
                     except Exception as e:
                         st.error(f"Diagnostic error: {e}")
+                
+                if st.button("🔎 Find Missing Pages", help="Scan for pages not yet indexed"):
+                    with st.spinner("Scanning documentation site..."):
+                        try:
+                            check_urls = [
+                                "https://docs.valence.desire2learn.com/",
+                                "https://docs.valence.desire2learn.com/reference.html",
+                                "https://docs.valence.desire2learn.com/http-routingtable.html",
+                            ]
+                            
+                            discovered_urls = set()
+                            scan_client = httpx.Client(timeout=30.0, follow_redirects=True)
+                            
+                            for check_url in check_urls:
+                                try:
+                                    response = scan_client.get(check_url)
+                                    if response.status_code == 200:
+                                        soup = BeautifulSoup(response.text, "html.parser")
+                                        for a in soup.find_all("a", href=True):
+                                            href = a["href"]
+                                            if href.startswith("#") or href.startswith("mailto:"):
+                                                continue
+                                            abs_url = urljoin(check_url, href)
+                                            parsed = urlparse(abs_url)
+                                            if parsed.hostname == "docs.valence.desire2learn.com":
+                                                clean = f"{parsed.scheme}://{parsed.hostname}{parsed.path}"
+                                                clean = clean.rstrip("/")
+                                                discovered_urls.add(clean)
+                                except:
+                                    pass
+                            
+                            scan_client.close()
+                            
+                            # Get indexed URLs
+                            db_client = chromadb.PersistentClient(path=CHROMA_DIR)
+                            embedding_fn = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+                            collection = db_client.get_collection(name=COLLECTION_NAME, embedding_function=embedding_fn)
+                            all_data = collection.get(include=["metadatas"])
+                            
+                            indexed_urls = set()
+                            for meta in all_data["metadatas"]:
+                                url = meta.get("source_url", "")
+                                if url:
+                                    indexed_urls.add(url.rstrip("/"))
+                            
+                            # Filter to HTML pages only
+                            html_pages = {u for u in discovered_urls 
+                                         if u.endswith(".html") or not "." in u.split("/")[-1]}
+                            
+                            # Exclude utility pages
+                            skip_patterns = ["search.html", "genindex.html", "py-modindex.html", "_sources", "_static"]
+                            html_pages = {u for u in html_pages 
+                                         if not any(skip in u for skip in skip_patterns)}
+                            
+                            # Find missing
+                            missing = html_pages - indexed_urls
+                            
+                            st.info(f"**Found {len(html_pages)} content pages on site**")
+                            st.info(f"**Currently indexed: {len(indexed_urls)} pages**")
+                            
+                            if missing:
+                                st.warning(f"**Potentially missing: {len(missing)} pages**")
+                                with st.expander("📋 Missing URLs"):
+                                    for url in sorted(missing):
+                                        st.write(f"- {url}")
+                            else:
+                                st.success("✅ All discoverable pages are indexed!")
+                                
+                        except Exception as e:
+                            st.error(f"Error scanning: {e}")
         
         st.divider()
         

@@ -344,351 +344,186 @@ def build_vector_store(chunks, progress_callback=None):
 # ============================================================================
 
 def build_knowledge_base(force_rebuild=False):
-    """
-    Build or load the knowledge base.
-    Returns (success: bool, message: str, stats: dict)
-    """
+    """Build or load the knowledge base with enhanced error handling."""
     cache_path = Path(SCRAPE_CACHE_FILE)
     chroma_path = Path(CHROMA_DIR)
     
-    # Check if we already have a valid knowledge base
+    # Check if we should attempt to load existing KB
     if not force_rebuild and chroma_path.exists() and cache_path.exists():
         try:
+            logger.info("Attempting to load existing knowledge base...")
             metadata = json.loads(cache_path.read_text())
-            return True, f"Knowledge base loaded (last updated: {metadata['scraped_at']})", metadata
-        except:
-            pass
+            
+            # Verify the collection actually exists and is accessible
+            client = chromadb.PersistentClient(path=CHROMA_DIR)
+            embedding_fn = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+            
+            try:
+                collection = client.get_collection(
+                    name=COLLECTION_NAME,
+                    embedding_function=embedding_fn
+                )
+                count = collection.count()
+                logger.info(f"Successfully loaded existing KB with {count} chunks")
+                return True, f"Knowledge base loaded ({metadata.get('scraped_at', 'unknown')[:10]}, {count} chunks)", metadata
+            except Exception as e:
+                logger.warning(f"Collection exists but couldn't be loaded: {e}")
+                logger.info("Will rebuild from scratch...")
+                # Fall through to rebuild
+        except Exception as e:
+            logger.warning(f"Failed to load existing KB: {e}")
+            # Fall through to rebuild
     
-    # Need to build from scratch
-    logger.info("Building knowledge base from scratch...")
+    # Need to rebuild
+    logger.info("=" * 60)
+    logger.info("BUILDING KNOWLEDGE BASE FROM SCRATCH")
+    logger.info("=" * 60)
     
-    # Progress tracking
     status_placeholder = st.empty()
     progress_bar = st.progress(0)
+    log_container = st.expander("📋 Detailed Build Log", expanded=False)
+    
+    def log_message(msg, level="info"):
+        """Log to both logger and Streamlit UI."""
+        if level == "info":
+            logger.info(msg)
+        elif level == "warning":
+            logger.warning(msg)
+        elif level == "error":
+            logger.error(msg)
+        with log_container:
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            st.text(f"[{timestamp}] {msg}")
     
     try:
+        # Clean up any corrupted data
+        log_message("Cleaning up any existing data...")
+        if chroma_path.exists():
+            import shutil
+            shutil.rmtree(chroma_path)
+            log_message(f"Removed old chroma_db directory")
+        if cache_path.exists():
+            cache_path.unlink()
+            log_message(f"Removed old metadata file")
+        
         # Step 1: Crawl
+        log_message("=" * 40)
+        log_message("STEP 1: CRAWLING DOCUMENTATION")
+        log_message("=" * 40)
         status_placeholder.info("📥 Step 1/3: Crawling D2L documentation...")
+        
         crawler = DocCrawler()
+        crawled_count = [0]  # Use list for closure mutability
         
         def crawl_progress(count, url):
-            progress_bar.progress(min(count / MAX_PAGES, 0.33))
-            status_placeholder.info(f"📥 Crawling page {count}/{MAX_PAGES}: {url[:60]}...")
+            crawled_count[0] = count
+            progress = min(count / MAX_PAGES, 0.33)
+            progress_bar.progress(progress)
+            status_placeholder.info(f"📥 Crawling page {count}/{MAX_PAGES}...")
+            if count % 10 == 0:  # Log every 10th page
+                log_message(f"Crawled {count} pages so far...")
         
         pages = crawler.crawl_all(max_pages=MAX_PAGES, progress_callback=crawl_progress)
         crawler.close()
         
+        log_message(f"✓ Crawling complete: {len(pages)} pages retrieved")
+        
+        if not pages:
+            raise Exception("No pages were crawled successfully. Check your internet connection.")
+        
         # Step 2: Chunk
+        log_message("=" * 40)
+        log_message("STEP 2: CREATING CHUNKS")
+        log_message("=" * 40)
         status_placeholder.info("✂️ Step 2/3: Creating searchable chunks...")
         
+        processed_pages = [0]
+        
         def chunk_progress(current, total):
-            progress_bar.progress(0.33 + (current / total) * 0.33)
-            status_placeholder.info(f"✂️ Processing page {current}/{total}...")
+            processed_pages[0] = current
+            progress = 0.33 + (current / total) * 0.33
+            progress_bar.progress(progress)
+            if current % 20 == 0 or current == total:
+                log_message(f"Processed {current}/{total} pages into chunks")
         
         chunks = create_chunks(pages, progress_callback=chunk_progress)
         
-        # Step 3: Embed and store
-        status_placeholder.info("🧠 Step 3/3: Building vector embeddings (this may take a few minutes)...")
+        log_message(f"✓ Chunking complete: {len(chunks)} chunks created")
+        
+        if not chunks:
+            raise Exception("No chunks were created from the crawled pages.")
+        
+        # Verify chunk uniqueness
+        chunk_ids = [c.chunk_id for c in chunks]
+        unique_ids = set(chunk_ids)
+        if len(chunk_ids) != len(unique_ids):
+            duplicates = len(chunk_ids) - len(unique_ids)
+            log_message(f"⚠ Warning: Found {duplicates} duplicate chunk IDs (should not happen)", "warning")
+        else:
+            log_message(f"✓ All {len(chunk_ids)} chunk IDs are unique")
+        
+        # Step 3: Embed
+        log_message("=" * 40)
+        log_message("STEP 3: BUILDING VECTOR STORE")
+        log_message("=" * 40)
+        status_placeholder.info("🧠 Step 3/3: Building vector embeddings (this takes a few minutes)...")
+        
+        log_message("Initializing ChromaDB...")
+        embedded_batches = [0]
         
         def embed_progress(batch, total_batches):
-            progress_bar.progress(0.66 + (batch / total_batches) * 0.34)
+            embedded_batches[0] = batch
+            progress = 0.66 + (batch / total_batches) * 0.34
+            progress_bar.progress(progress)
             status_placeholder.info(f"🧠 Embedding batch {batch}/{total_batches}...")
+            log_message(f"Embedded batch {batch}/{total_batches}")
         
-        build_vector_store(chunks, progress_callback=embed_progress)
+        collection = build_vector_store(chunks, progress_callback=embed_progress)
+        
+        final_count = collection.count()
+        log_message(f"✓ Vector store complete: {final_count} vectors stored")
         
         # Save metadata
         metadata = {
             "scraped_at": datetime.utcnow().isoformat(),
             "pages_count": len(pages),
             "chunks_count": len(chunks),
-            "max_pages": MAX_PAGES
+            "vectors_count": final_count,
+            "max_pages_crawled": MAX_PAGES,
         }
         cache_path.write_text(json.dumps(metadata, indent=2))
+        log_message(f"✓ Metadata saved to {SCRAPE_CACHE_FILE}")
+        
+        # Final verification
+        log_message("=" * 40)
+        log_message("VERIFICATION")
+        log_message("=" * 40)
+        log_message(f"Pages crawled: {len(pages)}")
+        log_message(f"Chunks created: {len(chunks)}")
+        log_message(f"Vectors stored: {final_count}")
+        log_message(f"Build completed at: {metadata['scraped_at']}")
         
         progress_bar.progress(1.0)
         status_placeholder.success(
             f"✅ Knowledge base built successfully!\n\n"
-            f"- Pages scraped: {len(pages)}\n"
-            f"- Chunks created: {len(chunks)}\n"
-            f"- Completed at: {metadata['scraped_at']}"
+            f"📄 Pages: {len(pages)}\n"
+            f"✂️ Chunks: {len(chunks)}\n"
+            f"🧠 Vectors: {final_count}\n\n"
+            f"You can now start asking questions!"
         )
+        
+        log_message("=" * 60)
+        log_message("BUILD COMPLETE - READY TO USE")
+        log_message("=" * 60)
         
         return True, "Knowledge base built successfully", metadata
         
     except Exception as e:
         error_msg = f"Failed to build knowledge base: {str(e)}"
-        logger.error(error_msg)
-        status_placeholder.error(error_msg)
+        logger.error(error_msg, exc_info=True)
+        log_message(f"❌ ERROR: {error_msg}", "error")
+        status_placeholder.error(f"❌ {error_msg}\n\nCheck the build log for details.")
         return False, error_msg, {}
-
-# ============================================================================
-# LLM PROVIDERS
-# ============================================================================
-
-class HuggingFaceLLM:
-    """Free LLM via HuggingFace Inference API."""
-    def __init__(self):
-        self.model = "mistralai/Mistral-7B-Instruct-v0.3"
-        self.base_url = "https://api-inference.huggingface.co/models"
-    
-    def generate(self, messages, temperature=0.3, max_tokens=2000):
-        prompt = self._format_messages(messages)
-        
-        try:
-            response = httpx.post(
-                f"{self.base_url}/{self.model}",
-                headers={"Content-Type": "application/json"},
-                json={
-                    "inputs": prompt,
-                    "parameters": {
-                        "max_new_tokens": max_tokens,
-                        "temperature": max(temperature, 0.01),
-                        "return_full_text": False
-                    }
-                },
-                timeout=60.0
-            )
-            
-            if response.status_code == 200:
-                result = response.json()
-                if isinstance(result, list) and len(result) > 0:
-                    return result[0].get("generated_text", "").strip()
-            
-            return "The free model is currently loading. Please try again in a moment."
-        except Exception as e:
-            logger.error(f"HF API error: {e}")
-            return f"Error: {str(e)}"
-    
-    def _format_messages(self, messages):
-        parts = []
-        for msg in messages:
-            role = msg["role"]
-            content = msg["content"]
-            if role == "system":
-                parts.append(f"<s>[INST] <<SYS>>\n{content}\n<</SYS>>\n")
-            elif role == "user":
-                parts.append(f"{content} [/INST]")
-            elif role == "assistant":
-                parts.append(f"{content} </s><s>[INST] ")
-        return "".join(parts)
-
-class OpenAILLM:
-    """OpenAI GPT-4o-mini."""
-    def __init__(self, api_key):
-        self.api_key = api_key
-        self.model = "gpt-4o-mini"
-    
-    def generate(self, messages, temperature=0.3, max_tokens=2000):
-        try:
-            response = httpx.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": self.model,
-                    "messages": messages,
-                    "temperature": temperature,
-                    "max_tokens": max_tokens
-                },
-                timeout=60.0
-            )
-            response.raise_for_status()
-            return response.json()["choices"][0]["message"]["content"]
-        except Exception as e:
-            return f"OpenAI API error: {e}"
-    
-    def stream(self, messages, temperature=0.3, max_tokens=2000):
-        try:
-            with httpx.stream(
-                "POST",
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": self.model,
-                    "messages": messages,
-                    "temperature": temperature,
-                    "max_tokens": max_tokens,
-                    "stream": True
-                },
-                timeout=60.0
-            ) as response:
-                for line in response.iter_lines():
-                    if line.startswith("data: ") and line != "data: [DONE]":
-                        try:
-                            data = json.loads(line[6:])
-                            content = data["choices"][0]["delta"].get("content", "")
-                            if content:
-                                yield content
-                        except:
-                            continue
-        except Exception as e:
-            yield f"\n\nError: {e}"
-
-class XaiLLM:
-    """xAI Grok."""
-    def __init__(self, api_key):
-        self.api_key = api_key
-        self.model = "grok-3-mini-fast"
-        self.base_url = "https://api.x.ai/v1"
-    
-    def generate(self, messages, temperature=0.3, max_tokens=2000):
-        try:
-            response = httpx.post(
-                f"{self.base_url}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": self.model,
-                    "messages": messages,
-                    "temperature": temperature,
-                    "max_tokens": max_tokens
-                },
-                timeout=60.0
-            )
-            response.raise_for_status()
-            return response.json()["choices"][0]["message"]["content"]
-        except Exception as e:
-            return f"xAI API error: {e}"
-    
-    def stream(self, messages, temperature=0.3, max_tokens=2000):
-        try:
-            with httpx.stream(
-                "POST",
-                f"{self.base_url}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": self.model,
-                    "messages": messages,
-                    "temperature": temperature,
-                    "max_tokens": max_tokens,
-                    "stream": True
-                },
-                timeout=60.0
-            ) as response:
-                for line in response.iter_lines():
-                    if line.startswith("data: ") and line != "data: [DONE]":
-                        try:
-                            data = json.loads(line[6:])
-                            content = data["choices"][0]["delta"].get("content", "")
-                            if content:
-                                yield content
-                        except:
-                            continue
-        except Exception as e:
-            yield f"\n\nError: {e}"
-
-# ============================================================================
-# RAG ENGINE
-# ============================================================================
-
-class RAGEngine:
-    def __init__(self):
-        client = chromadb.PersistentClient(path=CHROMA_DIR)
-        embedding_fn = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
-        self.collection = client.get_collection(
-            name=COLLECTION_NAME,
-            embedding_function=embedding_fn
-        )
-    
-    def retrieve(self, query, n_results=6):
-        results = self.collection.query(
-            query_texts=[query],
-            n_results=n_results,
-            include=["documents", "metadatas", "distances"]
-        )
-        
-        chunks = []
-        if results["documents"] and results["documents"][0]:
-            for i, doc in enumerate(results["documents"][0]):
-                chunks.append({
-                    "content": doc,
-                    "metadata": results["metadatas"][0][i],
-                    "relevance": 1 - results["distances"][0][i]
-                })
-        
-        return chunks
-    
-    def build_prompt(self, query, chunks, persona, history=None):
-        system_prompt = DEVELOPER_PROMPT if persona == "developer" else PLAIN_PROMPT
-        
-        context = "\n\n".join([
-            f"--- Source {i+1} [Relevance: {c['relevance']:.2f}] ---\n"
-            f"URL: {c['metadata'].get('source_url', 'unknown')}\n"
-            f"{c['content']}"
-            for i, c in enumerate(chunks)
-        ])
-        
-        messages = [{"role": "system", "content": system_prompt}]
-        
-        if history:
-            messages.extend(history[-6:])  # Last 3 turns
-        
-        user_msg = (
-            f"Documentation:\n\n{context}\n\n"
-            f"---\n\n"
-            f"Question: {query}\n\n"
-            f"Answer based on the documentation above."
-        )
-        
-        messages.append({"role": "user", "content": user_msg})
-        return messages
-    
-    def query(self, user_query, llm, persona="developer", history=None):
-        chunks = self.retrieve(user_query)
-        
-        if not chunks:
-            return "No relevant documentation found.", []
-        
-        messages = self.build_prompt(user_query, chunks, persona, history)
-        response = llm.generate(messages)
-        
-        sources = []
-        seen = set()
-        for c in chunks:
-            url = c["metadata"].get("source_url", "")
-            if url and url not in seen:
-                seen.add(url)
-                sources.append({
-                    "url": url,
-                    "title": c["metadata"].get("title", ""),
-                    "relevance": c["relevance"]
-                })
-        
-        return response, sources
-    
-    def query_stream(self, user_query, llm, persona="developer", history=None):
-        chunks = self.retrieve(user_query)
-        
-        if not chunks:
-            def empty():
-                yield "No relevant documentation found."
-            return empty(), []
-        
-        messages = self.build_prompt(user_query, chunks, persona, history)
-        
-        sources = []
-        seen = set()
-        for c in chunks:
-            url = c["metadata"].get("source_url", "")
-            if url and url not in seen:
-                seen.add(url)
-                sources.append({
-                    "url": url,
-                    "title": c["metadata"].get("title", ""),
-                    "relevance": c["relevance"]
-                })
-        
-        return llm.stream(messages), sources
 
 # ============================================================================
 # STREAMLIT APP
@@ -703,7 +538,7 @@ def main():
     
     st.title("📚 D2L Brightspace API Assistant")
     
-    # Initialize session state
+    # Session state
     if "messages" not in st.session_state:
         st.session_state.messages = []
     if "kb_ready" not in st.session_state:
@@ -711,65 +546,136 @@ def main():
     if "kb_metadata" not in st.session_state:
         st.session_state.kb_metadata = {}
     
-    # Check/build knowledge base
+    # Build/load knowledge base
     if not st.session_state.kb_ready:
-        with st.spinner("🔍 Checking knowledge base..."):
-            success, message, metadata = build_knowledge_base(force_rebuild=False)
-            st.session_state.kb_ready = success
-            st.session_state.kb_metadata = metadata
+        st.info("🔍 Initializing knowledge base...")
+        success, message, metadata = build_knowledge_base(force_rebuild=False)
+        st.session_state.kb_ready = success
+        st.session_state.kb_metadata = metadata
+        
+        if not success:
+            st.error(f"**Failed to initialize knowledge base:**\n\n{message}")
             
-            if not success:
-                st.error(message)
-                st.stop()
+            # Offer recovery options
+            st.warning("### Recovery Options:")
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                if st.button("🔄 Try Rebuilding", type="primary"):
+                    # Force clean rebuild
+                    import shutil
+                    if Path(CHROMA_DIR).exists():
+                        shutil.rmtree(CHROMA_DIR)
+                    if Path(SCRAPE_CACHE_FILE).exists():
+                        Path(SCRAPE_CACHE_FILE).unlink()
+                    st.session_state.kb_ready = False
+                    st.rerun()
+            
+            with col2:
+                if st.button("📋 View Logs"):
+                    st.info("Check the build log above for detailed error information.")
+            
+            st.stop()
+        else:
+            # Successfully loaded/built - force refresh to show chat interface
+            time.sleep(1)  # Brief pause to show success message
+            st.rerun()
     
     # Load RAG engine
     if "rag" not in st.session_state:
-        with st.spinner("Loading RAG engine..."):
-            st.session_state.rag = RAGEngine()
+        try:
+            with st.spinner("Loading search engine..."):
+                st.session_state.rag = RAGEngine()
+                logger.info("RAG engine loaded successfully")
+        except Exception as e:
+            st.error(f"Failed to load RAG engine: {e}")
+            logger.error(f"RAG engine error: {e}", exc_info=True)
+            
+            if st.button("🔄 Reset and Rebuild"):
+                import shutil
+                if Path(CHROMA_DIR).exists():
+                    shutil.rmtree(CHROMA_DIR)
+                if Path(SCRAPE_CACHE_FILE).exists():
+                    Path(SCRAPE_CACHE_FILE).unlink()
+                st.session_state.kb_ready = False
+                if "rag" in st.session_state:
+                    del st.session_state.rag
+                st.rerun()
+            
+            st.stop()
     
     # Sidebar
     with st.sidebar:
         st.header("⚙️ Settings")
         
-        # Knowledge base info
+        # KB info
         if st.session_state.kb_metadata:
-            st.info(
+            scraped_at = st.session_state.kb_metadata.get('scraped_at', 'unknown')
+            if scraped_at != 'unknown':
+                scraped_at = scraped_at[:10]
+            pages = st.session_state.kb_metadata.get('pages_count', '?')
+            chunks = st.session_state.kb_metadata.get('chunks_count', '?')
+            vectors = st.session_state.kb_metadata.get('vectors_count', chunks)
+            
+            st.success(
                 f"📊 **Knowledge Base**\n\n"
-                f"Pages: {st.session_state.kb_metadata.get('pages_count', '?')}\n\n"
-                f"Chunks: {st.session_state.kb_metadata.get('chunks_count', '?')}\n\n"
-                f"Updated: {st.session_state.kb_metadata.get('scraped_at', 'unknown')[:10]}"
+                f"📄 {pages} pages\n"
+                f"✂️ {chunks} chunks\n"
+                f"🧠 {vectors} vectors\n\n"
+                f"📅 Updated: {scraped_at}"
             )
             
-            # Admin refresh button
             with st.expander("🔧 Admin Tools"):
-                admin_password = st.text_input("Admin Password:", type="password", key="admin_pw")
-                if st.button("🔄 Refresh Documentation"):
-                    try:
-                        correct_pw = st.secrets.get("ADMIN_PASSWORD", "admin123")
-                        if admin_password == correct_pw:
-                            st.session_state.kb_ready = False
-                            st.session_state.kb_metadata = {}
-                            if "rag" in st.session_state:
-                                del st.session_state.rag
-                            build_knowledge_base(force_rebuild=True)
-                            st.rerun()
-                        else:
-                            st.error("Incorrect password")
-                    except:
-                        st.error("Admin password not configured")
+                admin_pw = st.text_input("Admin Password:", type="password", key="admin_pw")
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    if st.button("🔄 Refresh Docs", help="Re-scrape documentation from D2L"):
+                        try:
+                            correct_pw = st.secrets.get("ADMIN_PASSWORD", "admin")
+                            if admin_pw == correct_pw:
+                                st.session_state.kb_ready = False
+                                if "rag" in st.session_state:
+                                    del st.session_state.rag
+                                # Clean slate
+                                import shutil
+                                if Path(CHROMA_DIR).exists():
+                                    shutil.rmtree(CHROMA_DIR)
+                                if Path(SCRAPE_CACHE_FILE).exists():
+                                    Path(SCRAPE_CACHE_FILE).unlink()
+                                st.rerun()
+                            else:
+                                st.error("❌ Wrong password")
+                        except Exception as e:
+                            st.error(f"Error: {e}")
+                
+                with col2:
+                    if st.button("🗑️ Reset KB", help="Delete and rebuild knowledge base"):
+                        try:
+                            correct_pw = st.secrets.get("ADMIN_PASSWORD", "admin")
+                            if admin_pw == correct_pw:
+                                import shutil
+                                if Path(CHROMA_DIR).exists():
+                                    shutil.rmtree(CHROMA_DIR)
+                                if Path(SCRAPE_CACHE_FILE).exists():
+                                    Path(SCRAPE_CACHE_FILE).unlink()
+                                st.success("✅ KB deleted. Refresh page to rebuild.")
+                            else:
+                                st.error("❌ Wrong password")
+                        except Exception as e:
+                            st.error(f"Error: {e}")
         
         st.divider()
         
-        # Persona
         persona = st.radio(
             "Response Style:",
             ["developer", "plain_english"],
-            format_func=lambda x: "👨‍💻 Developer" if x == "developer" else "📝 Plain English"
+            format_func=lambda x: "👨‍💻 Developer Mode" if x == "developer" else "📝 Plain English"
         )
         
         st.divider()
         
-        # Model selection
         model = st.selectbox(
             "AI Model:",
             ["free", "openai", "xai"],
@@ -782,81 +688,118 @@ def main():
         
         api_key = None
         if model in ["openai", "xai"]:
-            password = st.text_input("Access Password:", type="password")
+            password = st.text_input("Model Password:", type="password", key="model_pw")
             if password:
                 try:
-                    if password == st.secrets.get("MODEL_PASSWORD", ""):
+                    correct = st.secrets.get("MODEL_PASSWORD", "")
+                    if password == correct:
                         st.success("✅ Access granted")
                         api_key = st.secrets.get(
                             "OPENAI_API_KEY" if model == "openai" else "XAI_API_KEY"
                         )
                     else:
-                        st.error("❌ Incorrect password")
+                        st.error("❌ Wrong password")
                         model = "free"
-                except:
-                    st.warning("No secrets configured")
+                except Exception as e:
+                    st.warning(f"Secrets error: {e}")
                     model = "free"
         
         st.divider()
         
-        if st.button("🗑️ Clear Chat"):
+        if st.button("🗑️ Clear Chat History"):
             st.session_state.messages = []
             st.rerun()
+        
+        # Debug info
+        with st.expander("🐛 Debug Info"):
+            st.text(f"KB Ready: {st.session_state.kb_ready}")
+            st.text(f"RAG Loaded: {'rag' in st.session_state}")
+            st.text(f"Messages: {len(st.session_state.messages)}")
+            if Path(CHROMA_DIR).exists():
+                st.text(f"ChromaDB exists: ✓")
+            else:
+                st.text(f"ChromaDB exists: ✗")
+            if Path(SCRAPE_CACHE_FILE).exists():
+                st.text(f"Cache exists: ✓")
+            else:
+                st.text(f"Cache exists: ✗")
     
-    # Display chat history
+    # Chat history
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
             if msg.get("sources"):
                 with st.expander(f"📖 Sources ({len(msg['sources'])})"):
                     for src in msg["sources"]:
-                        st.markdown(f"- [{src['title']}]({src['url']}) (relevance: {src['relevance']:.0%})")
+                        title_preview = src['title'][:60] + "..." if len(src['title']) > 60 else src['title']
+                        st.markdown(f"- [{title_preview}]({src['url']}) ({src['relevance']:.0%})")
+    
+    # Welcome message
+    if not st.session_state.messages:
+        st.info(
+            "👋 **Welcome!** I can answer questions about the D2L Brightspace API.\n\n"
+            "Try asking:\n"
+            "- *What are the authentication methods?*\n"
+            "- *How do I enroll a user in a course?*\n"
+            "- *Show me the parameters for GET /d2l/api/lp/{version}/users/*"
+        )
     
     # Chat input
     if prompt := st.chat_input("Ask about the D2L API..."):
-        # Display user message
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
         
         # Get LLM
-        if model == "free":
-            llm = HuggingFaceLLM()
-        elif model == "openai":
-            llm = OpenAILLM(api_key)
-        else:
-            llm = XaiLLM(api_key)
+        try:
+            if model == "free":
+                llm = HuggingFaceLLM()
+            elif model == "openai":
+                if not api_key:
+                    raise ValueError("OpenAI API key not available")
+                llm = OpenAILLM(api_key)
+            else:
+                if not api_key:
+                    raise ValueError("xAI API key not available")
+                llm = XaiLLM(api_key)
+        except Exception as e:
+            with st.chat_message("assistant"):
+                st.error(f"Failed to initialize LLM: {e}")
+            st.stop()
         
-        # Build history
         history = [
             {"role": m["role"], "content": m["content"]}
             for m in st.session_state.messages[:-1]
         ]
         
-        # Generate response
         with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                if model in ["openai", "xai"] and hasattr(llm, "stream"):
-                    stream, sources = st.session_state.rag.query_stream(
-                        prompt, llm, persona, history
-                    )
-                    response = st.write_stream(stream)
-                else:
-                    response, sources = st.session_state.rag.query(
-                        prompt, llm, persona, history
-                    )
-                    st.markdown(response)
-            
-            if sources:
-                with st.expander(f"📖 Sources ({len(sources)})"):
-                    for src in sources:
-                        st.markdown(f"- [{src['title']}]({src['url']}) (relevance: {src['relevance']:.0%})")
-        
-        st.session_state.messages.append({
-            "role": "assistant",
-            "content": response,
-            "sources": sources
-        })
+            try:
+                with st.spinner("Searching documentation..."):
+                    if model in ["openai", "xai"] and api_key:
+                        stream, sources = st.session_state.rag.query_stream(
+                            prompt, llm, persona, history
+                        )
+                        response = st.write_stream(stream)
+                    else:
+                        response, sources = st.session_state.rag.query(
+                            prompt, llm, persona, history
+                        )
+                        st.markdown(response)
+                
+                if sources:
+                    with st.expander(f"📖 Sources ({len(sources)})"):
+                        for src in sources:
+                            title_preview = src['title'][:60] + "..." if len(src['title']) > 60 else src['title']
+                            st.markdown(f"- [{title_preview}]({src['url']}) ({src['relevance']:.0%})")
+                
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": response,
+                    "sources": sources
+                })
+            except Exception as e:
+                st.error(f"Error generating response: {e}")
+                logger.error(f"Query error: {e}", exc_info=True)
 
 if __name__ == "__main__":
     main()

@@ -12,19 +12,18 @@ import json
 import re
 import hashlib
 import logging
+import shutil
+import gc  # <-- Add this line
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Optional
 from datetime import datetime
 from urllib.parse import urljoin, urlparse, urldefrag
 import time
 
-# Third-party imports
 import httpx
 from bs4 import BeautifulSoup
 import chromadb
 from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 

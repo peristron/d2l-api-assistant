@@ -646,7 +646,7 @@ class HuggingFaceLLM:
     """Free LLM via HuggingFace Inference API."""
     def __init__(self):
         self.model = "mistralai/Mistral-7B-Instruct-v0.3"
-        self.base_url = "https://api-inference.huggingface.co/models"
+        self.base_url = "https://router.huggingface.co/hf"  # Updated endpoint
     
     def generate(self, messages, temperature=0.3, max_tokens=2000):
         prompt = self._format_messages(messages)

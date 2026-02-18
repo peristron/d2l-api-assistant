@@ -175,7 +175,22 @@ class DocCrawler:
 def create_chunks(pages, progress_callback=None):
     """Convert pages into searchable chunks."""
     chunks = []
+    seen_ids = set()  # Track IDs we've already used
     total_pages = len(pages)
+    
+    def make_unique_id(base_string):
+        """Generate a unique ID, handling collisions."""
+        chunk_id = hashlib.md5(base_string.encode()).hexdigest()[:16]
+        if chunk_id not in seen_ids:
+            seen_ids.add(chunk_id)
+            return chunk_id
+        # Handle collision by adding a counter
+        counter = 1
+        while f"{chunk_id}_{counter}" in seen_ids:
+            counter += 1
+        unique_id = f"{chunk_id}_{counter}"
+        seen_ids.add(unique_id)
+        return unique_id
     
     for idx, page in enumerate(pages):
         if progress_callback:
@@ -188,7 +203,7 @@ def create_chunks(pages, progress_callback=None):
         
         # Create page summary chunk
         summary = content[:1000]
-        chunk_id = hashlib.md5(f"{url}|summary".encode()).hexdigest()[:16]
+        chunk_id = make_unique_id(f"{url}|summary")
         chunks.append(Chunk(
             chunk_id=chunk_id,
             content=f"# {title}\nCategory: {category}\n\n{summary}",
@@ -200,10 +215,17 @@ def create_chunks(pages, progress_callback=None):
             }
         ))
         
-        # Extract API routes
+        # Extract API routes - track which we've seen on this page
+        seen_routes_on_page = set()
         for match in ROUTE_PATTERN.finditer(content):
             method = match.group(1).upper()
             path = match.group(2)
+            
+            # Skip if we've already captured this route on this page
+            route_key = f"{method}|{path}"
+            if route_key in seen_routes_on_page:
+                continue
+            seen_routes_on_page.add(route_key)
             
             # Get context around the route
             start = max(0, match.start() - 500)
@@ -218,7 +240,7 @@ def create_chunks(pages, progress_callback=None):
                 f"{route_context}"
             )
             
-            chunk_id = hashlib.md5(f"{url}|route|{method}|{path}".encode()).hexdigest()[:16]
+            chunk_id = make_unique_id(f"{url}|route|{method}|{path}")
             chunks.append(Chunk(
                 chunk_id=chunk_id,
                 content=route_content,
@@ -237,6 +259,7 @@ def create_chunks(pages, progress_callback=None):
         chunk_size = 300  # words
         overlap = 50
         
+        part_num = 0
         for i in range(0, len(words), chunk_size - overlap):
             chunk_words = words[i:i + chunk_size]
             chunk_text = " ".join(chunk_words)
@@ -251,7 +274,7 @@ def create_chunks(pages, progress_callback=None):
                 f"{chunk_text}"
             )
             
-            chunk_id = hashlib.md5(f"{url}|content|{i}".encode()).hexdigest()[:16]
+            chunk_id = make_unique_id(f"{url}|content|{part_num}")
             chunks.append(Chunk(
                 chunk_id=chunk_id,
                 content=full_content,
@@ -260,9 +283,10 @@ def create_chunks(pages, progress_callback=None):
                     "title": title,
                     "category": category,
                     "chunk_type": "content",
-                    "part": i // (chunk_size - overlap)
+                    "part": part_num
                 }
             ))
+            part_num += 1
     
     logger.info(f"Created {len(chunks)} chunks from {len(pages)} pages")
     return chunks

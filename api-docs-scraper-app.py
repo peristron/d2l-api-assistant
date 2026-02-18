@@ -638,6 +638,177 @@ class RAGEngine:
         return llm.stream(messages), sources
 
 
+# ============================================================================
+# LLM PROVIDERS
+# ============================================================================
+
+class HuggingFaceLLM:
+    """Free LLM via HuggingFace Inference API."""
+    def __init__(self):
+        self.model = "mistralai/Mistral-7B-Instruct-v0.3"
+        self.base_url = "https://api-inference.huggingface.co/models"
+    
+    def generate(self, messages, temperature=0.3, max_tokens=2000):
+        prompt = self._format_messages(messages)
+        
+        try:
+            response = httpx.post(
+                f"{self.base_url}/{self.model}",
+                headers={"Content-Type": "application/json"},
+                json={
+                    "inputs": prompt,
+                    "parameters": {
+                        "max_new_tokens": max_tokens,
+                        "temperature": max(temperature, 0.01),
+                        "return_full_text": False
+                    }
+                },
+                timeout=120.0
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                if isinstance(result, list) and result:
+                    return result[0].get("generated_text", "").strip()
+                return str(result)
+            elif response.status_code == 503:
+                return "⏳ Model is loading. Please wait 20-30 seconds and try again."
+            else:
+                return f"API error ({response.status_code}): {response.text[:200]}"
+        except Exception as e:
+            return f"Error: {str(e)}"
+    
+    def _format_messages(self, messages):
+        parts = []
+        for msg in messages:
+            role = msg["role"]
+            content = msg["content"]
+            if role == "system":
+                parts.append(f"<s>[INST] <<SYS>>\n{content}\n<</SYS>>\n")
+            elif role == "user":
+                parts.append(f"{content} [/INST]")
+            elif role == "assistant":
+                parts.append(f"{content} </s><s>[INST] ")
+        return "".join(parts)
+
+
+class OpenAILLM:
+    """OpenAI GPT-4o-mini."""
+    def __init__(self, api_key):
+        self.api_key = api_key
+        self.model = "gpt-4o-mini"
+    
+    def generate(self, messages, temperature=0.3, max_tokens=2000):
+        try:
+            response = httpx.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": self.model,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens
+                },
+                timeout=60.0
+            )
+            response.raise_for_status()
+            return response.json()["choices"][0]["message"]["content"]
+        except Exception as e:
+            return f"OpenAI error: {e}"
+    
+    def stream(self, messages, temperature=0.3, max_tokens=2000):
+        try:
+            with httpx.stream(
+                "POST",
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": self.model,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    "stream": True
+                },
+                timeout=60.0
+            ) as response:
+                for line in response.iter_lines():
+                    if line.startswith("data: ") and line != "data: [DONE]":
+                        try:
+                            data = json.loads(line[6:])
+                            content = data["choices"][0]["delta"].get("content", "")
+                            if content:
+                                yield content
+                        except:
+                            continue
+        except Exception as e:
+            yield f"\n\nError: {e}"
+
+
+class XaiLLM:
+    """xAI Grok."""
+    def __init__(self, api_key):
+        self.api_key = api_key
+        self.model = "grok-3-mini-fast"
+        self.base_url = "https://api.x.ai/v1"
+    
+    def generate(self, messages, temperature=0.3, max_tokens=2000):
+        try:
+            response = httpx.post(
+                f"{self.base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": self.model,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens
+                },
+                timeout=60.0
+            )
+            response.raise_for_status()
+            return response.json()["choices"][0]["message"]["content"]
+        except Exception as e:
+            return f"xAI error: {e}"
+    
+    def stream(self, messages, temperature=0.3, max_tokens=2000):
+        try:
+            with httpx.stream(
+                "POST",
+                f"{self.base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": self.model,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                    "stream": True
+                },
+                timeout=60.0
+            ) as response:
+                for line in response.iter_lines():
+                    if line.startswith("data: ") and line != "data: [DONE]":
+                        try:
+                            data = json.loads(line[6:])
+                            content = data["choices"][0]["delta"].get("content", "")
+                            if content:
+                                yield content
+                        except:
+                            continue
+        except Exception as e:
+            yield f"\n\nError: {e}"
+
+
 def main():
     st.set_page_config(
         page_title="D2L API Assistant",

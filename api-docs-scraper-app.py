@@ -360,43 +360,38 @@ def build_knowledge_base(force_rebuild=False):
     cache_path = Path(SCRAPE_CACHE_FILE)
     chroma_path = Path(CHROMA_DIR)
     
-    # Check if we should attempt to load existing KB
+    # Check if we should load existing KB
     if not force_rebuild and chroma_path.exists() and cache_path.exists():
         try:
             logger.info("Attempting to load existing knowledge base...")
             metadata = json.loads(cache_path.read_text())
             
-            # Verify the collection actually exists and is accessible
-            client = chromadb.PersistentClient(path=CHROMA_DIR)
+            # Verify the collection is accessible
+            client = chromadb.PersistentClient(path=str(chroma_path))
             embedding_fn = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
             
-            try:
-                collection = client.get_collection(
-                    name=COLLECTION_NAME,
-                    embedding_function=embedding_fn
-                )
-                count = collection.count()
-                logger.info(f"Successfully loaded existing KB with {count} chunks")
-                return True, f"Knowledge base loaded ({metadata.get('scraped_at', 'unknown')[:10]}, {count} chunks)", metadata
-            except Exception as e:
-                logger.warning(f"Collection exists but couldn't be loaded: {e}")
-                logger.info("Will rebuild from scratch...")
-                # Fall through to rebuild
+            collection = client.get_collection(
+                name=COLLECTION_NAME,
+                embedding_function=embedding_fn
+            )
+            count = collection.count()
+            logger.info(f"Successfully loaded existing KB with {count} chunks")
+            return True, f"Knowledge base loaded ({count} chunks)", metadata
+            
         except Exception as e:
             logger.warning(f"Failed to load existing KB: {e}")
-            # Fall through to rebuild
+            logger.info("Will rebuild from scratch...")
     
-    # Need to rebuild
+    # Rebuild
     logger.info("=" * 60)
     logger.info("BUILDING KNOWLEDGE BASE FROM SCRATCH")
     logger.info("=" * 60)
     
     status_placeholder = st.empty()
     progress_bar = st.progress(0)
-    log_container = st.expander("📋 Detailed Build Log", expanded=False)
+    log_container = st.expander("📋 Detailed Build Log", expanded=True)
     
     def log_message(msg, level="info"):
-        """Log to both logger and Streamlit UI."""
         if level == "info":
             logger.info(msg)
         elif level == "warning":
@@ -408,31 +403,43 @@ def build_knowledge_base(force_rebuild=False):
             st.text(f"[{timestamp}] {msg}")
     
     try:
-        # Clean up any corrupted data
+        # ============================================================
+        # AGGRESSIVE CLEANUP - ensures completely fresh start
+        # ============================================================
         log_message("Cleaning up any existing data...")
+        
         if chroma_path.exists():
-            import shutil
             shutil.rmtree(chroma_path)
-            log_message(f"Removed old chroma_db directory")
+            log_message(f"Removed old {CHROMA_DIR} directory")
+            # Give filesystem time to complete deletion
+            time.sleep(0.5)
+        
         if cache_path.exists():
             cache_path.unlink()
-            log_message(f"Removed old metadata file")
+            log_message(f"Removed old {SCRAPE_CACHE_FILE} file")
         
-        # Step 1: Crawl
+        # Force garbage collection to release any held references
+        gc.collect()
+        
+        # Additional pause to ensure everything is cleaned up
+        time.sleep(0.5)
+        
+        log_message("Cleanup complete, starting fresh build...")
+        
+        # ============================================================
+        # STEP 1: CRAWL
+        # ============================================================
         log_message("=" * 40)
         log_message("STEP 1: CRAWLING DOCUMENTATION")
         log_message("=" * 40)
         status_placeholder.info("📥 Step 1/3: Crawling D2L documentation...")
         
         crawler = DocCrawler()
-        crawled_count = [0]  # Use list for closure mutability
         
         def crawl_progress(count, url):
-            crawled_count[0] = count
-            progress = min(count / MAX_PAGES, 0.33)
-            progress_bar.progress(progress)
+            progress_bar.progress(min(count / MAX_PAGES, 0.33))
             status_placeholder.info(f"📥 Crawling page {count}/{MAX_PAGES}...")
-            if count % 10 == 0:  # Log every 10th page
+            if count % 10 == 0:
                 log_message(f"Crawled {count} pages so far...")
         
         pages = crawler.crawl_all(max_pages=MAX_PAGES, progress_callback=crawl_progress)
@@ -441,100 +448,89 @@ def build_knowledge_base(force_rebuild=False):
         log_message(f"✓ Crawling complete: {len(pages)} pages retrieved")
         
         if not pages:
-            raise Exception("No pages were crawled successfully. Check your internet connection.")
+            raise Exception("No pages crawled. Check internet connection.")
         
-        # Step 2: Chunk
+        # ============================================================
+        # STEP 2: CHUNK
+        # ============================================================
         log_message("=" * 40)
         log_message("STEP 2: CREATING CHUNKS")
         log_message("=" * 40)
         status_placeholder.info("✂️ Step 2/3: Creating searchable chunks...")
         
-        processed_pages = [0]
-        
         def chunk_progress(current, total):
-            processed_pages[0] = current
-            progress = 0.33 + (current / total) * 0.33
-            progress_bar.progress(progress)
+            progress_bar.progress(0.33 + (current / total) * 0.33)
             if current % 20 == 0 or current == total:
-                log_message(f"Processed {current}/{total} pages into chunks")
+                log_message(f"Processed {current}/{total} pages")
         
         chunks = create_chunks(pages, progress_callback=chunk_progress)
         
         log_message(f"✓ Chunking complete: {len(chunks)} chunks created")
         
         if not chunks:
-            raise Exception("No chunks were created from the crawled pages.")
+            raise Exception("No chunks created from pages.")
         
-        # Verify chunk uniqueness
+        # Verify uniqueness
         chunk_ids = [c.chunk_id for c in chunks]
-        unique_ids = set(chunk_ids)
-        if len(chunk_ids) != len(unique_ids):
-            duplicates = len(chunk_ids) - len(unique_ids)
-            log_message(f"⚠ Warning: Found {duplicates} duplicate chunk IDs (should not happen)", "warning")
-        else:
-            log_message(f"✓ All {len(chunk_ids)} chunk IDs are unique")
+        if len(chunk_ids) != len(set(chunk_ids)):
+            raise Exception("Duplicate chunk IDs detected!")
+        log_message(f"✓ All {len(chunk_ids)} chunk IDs are unique")
         
-        # Step 3: Embed
+        # ============================================================
+        # STEP 3: EMBED
+        # ============================================================
         log_message("=" * 40)
         log_message("STEP 3: BUILDING VECTOR STORE")
         log_message("=" * 40)
-        status_placeholder.info("🧠 Step 3/3: Building vector embeddings (this takes a few minutes)...")
+        status_placeholder.info("🧠 Step 3/3: Building vector embeddings...")
         
         log_message("Initializing ChromaDB...")
-        embedded_batches = [0]
         
         def embed_progress(batch, total_batches):
-            embedded_batches[0] = batch
-            progress = 0.66 + (batch / total_batches) * 0.34
-            progress_bar.progress(progress)
+            progress_bar.progress(0.66 + (batch / total_batches) * 0.34)
             status_placeholder.info(f"🧠 Embedding batch {batch}/{total_batches}...")
             log_message(f"Embedded batch {batch}/{total_batches}")
         
         collection = build_vector_store(chunks, progress_callback=embed_progress)
         
         final_count = collection.count()
-        log_message(f"✓ Vector store complete: {final_count} vectors stored")
+        log_message(f"✓ Vector store complete: {final_count} vectors")
         
-        # Save metadata
+        # ============================================================
+        # SAVE METADATA
+        # ============================================================
         metadata = {
             "scraped_at": datetime.utcnow().isoformat(),
             "pages_count": len(pages),
             "chunks_count": len(chunks),
             "vectors_count": final_count,
-            "max_pages_crawled": MAX_PAGES,
         }
         cache_path.write_text(json.dumps(metadata, indent=2))
-        log_message(f"✓ Metadata saved to {SCRAPE_CACHE_FILE}")
+        log_message(f"✓ Metadata saved")
         
-        # Final verification
+        # ============================================================
+        # VERIFICATION & COMPLETE
+        # ============================================================
         log_message("=" * 40)
-        log_message("VERIFICATION")
+        log_message("BUILD COMPLETE")
+        log_message(f"  Pages: {len(pages)}")
+        log_message(f"  Chunks: {len(chunks)}")
+        log_message(f"  Vectors: {final_count}")
         log_message("=" * 40)
-        log_message(f"Pages crawled: {len(pages)}")
-        log_message(f"Chunks created: {len(chunks)}")
-        log_message(f"Vectors stored: {final_count}")
-        log_message(f"Build completed at: {metadata['scraped_at']}")
         
         progress_bar.progress(1.0)
         status_placeholder.success(
-            f"✅ Knowledge base built successfully!\n\n"
-            f"📄 Pages: {len(pages)}\n"
-            f"✂️ Chunks: {len(chunks)}\n"
-            f"🧠 Vectors: {final_count}\n\n"
-            f"You can now start asking questions!"
+            f"✅ Knowledge base built!\n\n"
+            f"📄 {len(pages)} pages | ✂️ {len(chunks)} chunks | 🧠 {final_count} vectors"
         )
         
-        log_message("=" * 60)
-        log_message("BUILD COMPLETE - READY TO USE")
-        log_message("=" * 60)
-        
-        return True, "Knowledge base built successfully", metadata
+        return True, "Success", metadata
         
     except Exception as e:
         error_msg = f"Failed to build knowledge base: {str(e)}"
         logger.error(error_msg, exc_info=True)
         log_message(f"❌ ERROR: {error_msg}", "error")
-        status_placeholder.error(f"❌ {error_msg}\n\nCheck the build log for details.")
+        status_placeholder.error(error_msg)
         return False, error_msg, {}
 
 # ============================================================================

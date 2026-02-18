@@ -1,10 +1,10 @@
 """
 D2L Brightspace API Documentation Assistant
-Single-file proof of concept with scraping, embedding, and chat interface.
+Single-file proof of concept with IN-APP scraping, embedding, and chat.
 
-Usage:
-1. First run: python app.py --scrape (crawls docs and builds vector store)
-2. Subsequent runs: streamlit run app.py
+First run: Automatically scrapes and builds knowledge base (takes ~10 mins)
+Subsequent runs: Loads from cache
+Admin: Password-protected "Refresh Docs" button to re-scrape
 """
 
 import streamlit as st
@@ -13,12 +13,11 @@ import re
 import hashlib
 import logging
 from pathlib import Path
-from dataclasses import dataclass, field, asdict
-from typing import Optional, Generator
+from dataclasses import dataclass, field
+from typing import Optional
 from datetime import datetime
 from urllib.parse import urljoin, urlparse, urldefrag
 import time
-import sys
 
 # Third-party imports
 import httpx
@@ -36,6 +35,7 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://docs.valence.desire2learn.com/"
 CHROMA_DIR = "chroma_db"
 COLLECTION_NAME = "d2l_docs"
+SCRAPE_CACHE_FILE = "scrape_metadata.json"
 MAX_PAGES = 300
 CRAWL_DELAY = 0.3
 
@@ -122,7 +122,6 @@ class DocCrawler:
                 "title": title,
                 "content": content,
                 "category": category,
-                "crawled_at": datetime.utcnow().isoformat()
             }
             
             # Find links
@@ -139,7 +138,7 @@ class DocCrawler:
             logger.warning(f"Failed to crawl {url}: {e}")
             return None, []
 
-    def crawl_all(self, max_pages=MAX_PAGES):
+    def crawl_all(self, max_pages=MAX_PAGES, progress_callback=None):
         queue = [self.normalize_url(BASE_URL)]
         
         while queue and len(self.pages) < max_pages:
@@ -149,6 +148,10 @@ class DocCrawler:
                 continue
             
             self.visited.add(url)
+            
+            if progress_callback:
+                progress_callback(len(self.pages) + 1, url)
+            
             logger.info(f"Crawling [{len(self.pages)+1}]: {url}")
             
             page_data, links = self.crawl_page(url)
@@ -169,11 +172,15 @@ class DocCrawler:
 # CHUNKING & EMBEDDING
 # ============================================================================
 
-def create_chunks(pages):
+def create_chunks(pages, progress_callback=None):
     """Convert pages into searchable chunks."""
     chunks = []
+    total_pages = len(pages)
     
-    for page in pages:
+    for idx, page in enumerate(pages):
+        if progress_callback:
+            progress_callback(idx + 1, total_pages)
+        
         content = page["content"]
         url = page["url"]
         title = page["title"]
@@ -257,10 +264,10 @@ def create_chunks(pages):
                 }
             ))
     
-    logger.info(f"Created {len(chunks)} chunks")
+    logger.info(f"Created {len(chunks)} chunks from {len(pages)} pages")
     return chunks
 
-def build_vector_store(chunks):
+def build_vector_store(chunks, progress_callback=None):
     """Build ChromaDB vector store from chunks."""
     Path(CHROMA_DIR).mkdir(exist_ok=True)
     
@@ -281,8 +288,13 @@ def build_vector_store(chunks):
     
     # Add in batches
     batch_size = 50
+    total_batches = (len(chunks) + batch_size - 1) // batch_size
+    
     for i in range(0, len(chunks), batch_size):
         batch = chunks[i:i + batch_size]
+        
+        if progress_callback:
+            progress_callback(i // batch_size + 1, total_batches)
         
         ids = [c.chunk_id for c in batch]
         documents = [c.content for c in batch]
@@ -298,10 +310,92 @@ def build_vector_store(chunks):
             metadatas.append(meta)
         
         collection.add(ids=ids, documents=documents, metadatas=metadatas)
-        logger.info(f"Added batch {i//batch_size + 1}/{(len(chunks) + batch_size - 1)//batch_size}")
+        logger.info(f"Added batch {i//batch_size + 1}/{total_batches}")
     
     logger.info(f"Vector store built with {collection.count()} chunks")
     return collection
+
+# ============================================================================
+# KNOWLEDGE BASE BUILDER
+# ============================================================================
+
+def build_knowledge_base(force_rebuild=False):
+    """
+    Build or load the knowledge base.
+    Returns (success: bool, message: str, stats: dict)
+    """
+    cache_path = Path(SCRAPE_CACHE_FILE)
+    chroma_path = Path(CHROMA_DIR)
+    
+    # Check if we already have a valid knowledge base
+    if not force_rebuild and chroma_path.exists() and cache_path.exists():
+        try:
+            metadata = json.loads(cache_path.read_text())
+            return True, f"Knowledge base loaded (last updated: {metadata['scraped_at']})", metadata
+        except:
+            pass
+    
+    # Need to build from scratch
+    logger.info("Building knowledge base from scratch...")
+    
+    # Progress tracking
+    status_placeholder = st.empty()
+    progress_bar = st.progress(0)
+    
+    try:
+        # Step 1: Crawl
+        status_placeholder.info("📥 Step 1/3: Crawling D2L documentation...")
+        crawler = DocCrawler()
+        
+        def crawl_progress(count, url):
+            progress_bar.progress(min(count / MAX_PAGES, 0.33))
+            status_placeholder.info(f"📥 Crawling page {count}/{MAX_PAGES}: {url[:60]}...")
+        
+        pages = crawler.crawl_all(max_pages=MAX_PAGES, progress_callback=crawl_progress)
+        crawler.close()
+        
+        # Step 2: Chunk
+        status_placeholder.info("✂️ Step 2/3: Creating searchable chunks...")
+        
+        def chunk_progress(current, total):
+            progress_bar.progress(0.33 + (current / total) * 0.33)
+            status_placeholder.info(f"✂️ Processing page {current}/{total}...")
+        
+        chunks = create_chunks(pages, progress_callback=chunk_progress)
+        
+        # Step 3: Embed and store
+        status_placeholder.info("🧠 Step 3/3: Building vector embeddings (this may take a few minutes)...")
+        
+        def embed_progress(batch, total_batches):
+            progress_bar.progress(0.66 + (batch / total_batches) * 0.34)
+            status_placeholder.info(f"🧠 Embedding batch {batch}/{total_batches}...")
+        
+        build_vector_store(chunks, progress_callback=embed_progress)
+        
+        # Save metadata
+        metadata = {
+            "scraped_at": datetime.utcnow().isoformat(),
+            "pages_count": len(pages),
+            "chunks_count": len(chunks),
+            "max_pages": MAX_PAGES
+        }
+        cache_path.write_text(json.dumps(metadata, indent=2))
+        
+        progress_bar.progress(1.0)
+        status_placeholder.success(
+            f"✅ Knowledge base built successfully!\n\n"
+            f"- Pages scraped: {len(pages)}\n"
+            f"- Chunks created: {len(chunks)}\n"
+            f"- Completed at: {metadata['scraped_at']}"
+        )
+        
+        return True, "Knowledge base built successfully", metadata
+        
+    except Exception as e:
+        error_msg = f"Failed to build knowledge base: {str(e)}"
+        logger.error(error_msg)
+        status_placeholder.error(error_msg)
+        return False, error_msg, {}
 
 # ============================================================================
 # LLM PROVIDERS
@@ -576,7 +670,7 @@ class RAGEngine:
 # STREAMLIT APP
 # ============================================================================
 
-def run_streamlit_app():
+def main():
     st.set_page_config(
         page_title="D2L API Assistant",
         page_icon="📚",
@@ -585,23 +679,62 @@ def run_streamlit_app():
     
     st.title("📚 D2L Brightspace API Assistant")
     
-    # Check if vector store exists
-    if not Path(CHROMA_DIR).exists():
-        st.error(
-            "⚠️ Knowledge base not found!\n\n"
-            "Run: `python app.py --scrape` first to build the knowledge base."
-        )
-        st.stop()
-    
     # Initialize session state
     if "messages" not in st.session_state:
         st.session_state.messages = []
+    if "kb_ready" not in st.session_state:
+        st.session_state.kb_ready = False
+    if "kb_metadata" not in st.session_state:
+        st.session_state.kb_metadata = {}
+    
+    # Check/build knowledge base
+    if not st.session_state.kb_ready:
+        with st.spinner("🔍 Checking knowledge base..."):
+            success, message, metadata = build_knowledge_base(force_rebuild=False)
+            st.session_state.kb_ready = success
+            st.session_state.kb_metadata = metadata
+            
+            if not success:
+                st.error(message)
+                st.stop()
+    
+    # Load RAG engine
     if "rag" not in st.session_state:
-        st.session_state.rag = RAGEngine()
+        with st.spinner("Loading RAG engine..."):
+            st.session_state.rag = RAGEngine()
     
     # Sidebar
     with st.sidebar:
         st.header("⚙️ Settings")
+        
+        # Knowledge base info
+        if st.session_state.kb_metadata:
+            st.info(
+                f"📊 **Knowledge Base**\n\n"
+                f"Pages: {st.session_state.kb_metadata.get('pages_count', '?')}\n\n"
+                f"Chunks: {st.session_state.kb_metadata.get('chunks_count', '?')}\n\n"
+                f"Updated: {st.session_state.kb_metadata.get('scraped_at', 'unknown')[:10]}"
+            )
+            
+            # Admin refresh button
+            with st.expander("🔧 Admin Tools"):
+                admin_password = st.text_input("Admin Password:", type="password", key="admin_pw")
+                if st.button("🔄 Refresh Documentation"):
+                    try:
+                        correct_pw = st.secrets.get("ADMIN_PASSWORD", "admin123")
+                        if admin_password == correct_pw:
+                            st.session_state.kb_ready = False
+                            st.session_state.kb_metadata = {}
+                            if "rag" in st.session_state:
+                                del st.session_state.rag
+                            build_knowledge_base(force_rebuild=True)
+                            st.rerun()
+                        else:
+                            st.error("Incorrect password")
+                    except:
+                        st.error("Admin password not configured")
+        
+        st.divider()
         
         # Persona
         persona = st.radio(
@@ -701,46 +834,5 @@ def run_streamlit_app():
             "sources": sources
         })
 
-# ============================================================================
-# CLI FOR SCRAPING
-# ============================================================================
-
-def run_scraper():
-    """Run the scraper to build the knowledge base."""
-    logger.info("=" * 60)
-    logger.info("STARTING SCRAPER")
-    logger.info("=" * 60)
-    
-    # Crawl
-    crawler = DocCrawler()
-    try:
-        pages = crawler.crawl_all(max_pages=MAX_PAGES)
-    finally:
-        crawler.close()
-    
-    # Save raw data
-    Path("scraped_data.json").write_text(json.dumps(pages, indent=2))
-    logger.info(f"Saved {len(pages)} pages to scraped_data.json")
-    
-    # Create chunks
-    chunks = create_chunks(pages)
-    
-    # Build vector store
-    build_vector_store(chunks)
-    
-    logger.info("=" * 60)
-    logger.info("SCRAPING COMPLETE")
-    logger.info(f"  Pages: {len(pages)}")
-    logger.info(f"  Chunks: {len(chunks)}")
-    logger.info("  Run: streamlit run app.py")
-    logger.info("=" * 60)
-
-# ============================================================================
-# MAIN
-# ============================================================================
-
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "--scrape":
-        run_scraper()
-    else:
-        run_streamlit_app()
+    main()

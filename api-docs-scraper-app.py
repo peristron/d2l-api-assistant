@@ -536,6 +536,108 @@ def build_knowledge_base(force_rebuild=False):
 # STREAMLIT APP
 # ============================================================================
 
+# ============================================================================
+# RAG ENGINE
+# ============================================================================
+
+class RAGEngine:
+    def __init__(self):
+        client = chromadb.PersistentClient(path=CHROMA_DIR)
+        embedding_fn = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+        self.collection = client.get_collection(
+            name=COLLECTION_NAME,
+            embedding_function=embedding_fn
+        )
+    
+    def retrieve(self, query, n_results=6):
+        results = self.collection.query(
+            query_texts=[query],
+            n_results=n_results,
+            include=["documents", "metadatas", "distances"]
+        )
+        
+        chunks = []
+        if results["documents"] and results["documents"][0]:
+            for i, doc in enumerate(results["documents"][0]):
+                chunks.append({
+                    "content": doc,
+                    "metadata": results["metadatas"][0][i],
+                    "relevance": 1 - results["distances"][0][i]
+                })
+        return chunks
+    
+    def build_prompt(self, query, chunks, persona, history=None):
+        system_prompt = DEVELOPER_PROMPT if persona == "developer" else PLAIN_PROMPT
+        
+        context = "\n\n".join([
+            f"--- Source {i+1} [{c['relevance']:.0%} match] ---\n"
+            f"URL: {c['metadata'].get('source_url', 'unknown')}\n"
+            f"{c['content']}"
+            for i, c in enumerate(chunks)
+        ])
+        
+        messages = [{"role": "system", "content": system_prompt}]
+        
+        if history:
+            messages.extend(history[-6:])
+        
+        user_msg = (
+            f"Documentation:\n\n{context}\n\n---\n\n"
+            f"Question: {query}\n\n"
+            f"Answer based on the documentation above."
+        )
+        
+        messages.append({"role": "user", "content": user_msg})
+        return messages
+    
+    def query(self, user_query, llm, persona="developer", history=None):
+        chunks = self.retrieve(user_query)
+        
+        if not chunks:
+            return "No relevant documentation found.", []
+        
+        messages = self.build_prompt(user_query, chunks, persona, history)
+        response = llm.generate(messages)
+        
+        sources = []
+        seen = set()
+        for c in chunks:
+            url = c["metadata"].get("source_url", "")
+            if url and url not in seen:
+                seen.add(url)
+                sources.append({
+                    "url": url,
+                    "title": c["metadata"].get("title", ""),
+                    "relevance": c["relevance"]
+                })
+        
+        return response, sources
+    
+    def query_stream(self, user_query, llm, persona="developer", history=None):
+        chunks = self.retrieve(user_query)
+        
+        if not chunks:
+            def empty():
+                yield "No relevant documentation found."
+            return empty(), []
+        
+        messages = self.build_prompt(user_query, chunks, persona, history)
+        
+        sources = []
+        seen = set()
+        for c in chunks:
+            url = c["metadata"].get("source_url", "")
+            if url and url not in seen:
+                seen.add(url)
+                sources.append({
+                    "url": url,
+                    "title": c["metadata"].get("title", ""),
+                    "relevance": c["relevance"]
+                })
+        
+        return llm.stream(messages), sources
+
+
 def main():
     st.set_page_config(
         page_title="D2L API Assistant",

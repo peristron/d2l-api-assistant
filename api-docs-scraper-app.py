@@ -451,14 +451,14 @@ class HuggingFaceLLM:
     def __init__(self, api_key):
         self.api_key = api_key
         self.model = "mistralai/Mistral-7B-Instruct-v0.3"
-        # UPDATED: Use the standard Inference API URL
-        self.base_url = "https://api-inference.huggingface.co/models"
+        # UPDATED: Use the new Router URL
+        self.base_url = "https://router.huggingface.co/hf"
     
     def generate(self, messages, temperature=0.3):
         prompt = self._format_messages(messages)
         try:
             response = httpx.post(
-                f"{self.base_url}/{self.model}",
+                f"{self.base_url}/models/{self.model}",
                 headers={
                     "Content-Type": "application/json",
                     "Authorization": f"Bearer {self.api_key}"

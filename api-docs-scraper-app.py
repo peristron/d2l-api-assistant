@@ -31,14 +31,44 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime
 from urllib.parse import urljoin, urlparse, urldefrag
+from typing import Optional, List, Dict, Any
 
 import httpx
 from bs4 import BeautifulSoup
 import chromadb
 from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
 
-logging.basicConfig(level=logging.INFO)
+# ============================================================================
+# LOGGING SETUP - Enhanced for debugging
+# ============================================================================
+
+# Create a custom logger
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
+
+# Store logs in session state for display
+def log_to_session(level: str, message: str):
+    """Log message and store in session state for UI display"""
+    timestamp = datetime.now().strftime('%H:%M:%S')
+    log_entry = f"[{timestamp}] [{level}] {message}"
+    
+    if "debug_logs" not in st.session_state:
+        st.session_state.debug_logs = []
+    
+    st.session_state.debug_logs.append(log_entry)
+    # Keep only last 100 logs
+    st.session_state.debug_logs = st.session_state.debug_logs[-100:]
+    
+    # Also log to standard logger
+    getattr(logger, level.lower(), logger.info)(message)
+
+def log_debug(msg): log_to_session("DEBUG", msg)
+def log_info(msg): log_to_session("INFO", msg)
+def log_warning(msg): log_to_session("WARNING", msg)
+def log_error(msg): log_to_session("ERROR", msg)
 
 # ============================================================================
 # CONFIGURATION
@@ -103,7 +133,7 @@ class DocCrawler:
         try:
             response = self.client.get(url)
             if response.status_code != 200:
-                logger.warning(f"Skipping {url} (Status {response.status_code})")
+                log_warning(f"Skipping {url} (Status {response.status_code})")
                 return None, []
             
             if "text/html" not in response.headers.get("content-type", ""):
@@ -149,7 +179,7 @@ class DocCrawler:
             return page_data, links
             
         except Exception as e:
-            logger.warning(f"Failed to crawl {url}: {e}")
+            log_warning(f"Failed to crawl {url}: {e}")
             return None, []
 
     def crawl_all(self, max_pages=MAX_PAGES, progress_callback=None):
@@ -161,7 +191,7 @@ class DocCrawler:
             if progress_callback:
                 progress_callback(len(self.pages) + 1, url)
             
-            logger.info(f"Crawling [{len(self.pages)+1}]: {url}")
+            log_info(f"Crawling [{len(self.pages)+1}]: {url}")
             page_data, links = self.crawl_page(url)
             
             if page_data and len(page_data["content"]) > 100:
@@ -174,7 +204,7 @@ class DocCrawler:
             
             time.sleep(CRAWL_DELAY)
         
-        logger.info(f"Crawled {len(self.pages)} pages")
+        log_info(f"Crawled {len(self.pages)} pages")
         return self.pages
 
     def close(self):
@@ -281,7 +311,7 @@ def build_vector_store(chunks, progress_callback=None):
         try:
             shutil.rmtree(chroma_path)
         except Exception as e:
-            logger.warning(f"Could not delete folder: {e}")
+            log_warning(f"Could not delete folder: {e}")
     
     chroma_path.mkdir(exist_ok=True)
     
@@ -322,7 +352,7 @@ def build_knowledge_base(force_rebuild=False):
     
     if not force_rebuild and chroma_path.exists() and cache_path.exists():
         try:
-            logger.info("Loading existing KB...")
+            log_info("Loading existing KB...")
             metadata = json.loads(cache_path.read_text())
             client = chromadb.PersistentClient(path=str(chroma_path))
             embedding_fn = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
@@ -330,7 +360,7 @@ def build_knowledge_base(force_rebuild=False):
             if collection.count() > 0:
                 return True, f"Loaded {collection.count()} chunks.", metadata
         except Exception as e:
-            logger.warning(f"Load failed ({e}), rebuilding...")
+            log_warning(f"Load failed ({e}), rebuilding...")
     
     status_placeholder = st.empty()
     progress_bar = st.progress(0)
@@ -339,7 +369,7 @@ def build_knowledge_base(force_rebuild=False):
     def log(msg):
         with log_container:
             st.text(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
-        logger.info(msg)
+        log_info(msg)
     
     try:
         log("Starting clean build...")
@@ -384,7 +414,7 @@ def build_knowledge_base(force_rebuild=False):
 
     except Exception as e:
         status_placeholder.error(f"Build failed: {e}")
-        log(f"ERROR: {e}")
+        log_error(f"Build failed: {e}")
         return False, str(e), {}
 
 # ============================================================================
@@ -401,6 +431,7 @@ class RAGEngine:
         )
     
     def retrieve(self, query, n_results=5):
+        log_debug(f"Retrieving documents for query: {query[:50]}...")
         try:
             results = self.collection.query(
                 query_texts=[query],
@@ -415,9 +446,10 @@ class RAGEngine:
                         "metadata": results["metadatas"][0][i],
                         "relevance": 1 - results["distances"][0][i]
                     })
+            log_debug(f"Retrieved {len(chunks)} chunks")
             return chunks
         except Exception as e:
-            logger.error(f"Retrieval error: {e}")
+            log_error(f"Retrieval error: {e}")
             return []
 
     def build_messages(self, query, chunks, persona, history=None):
@@ -447,20 +479,31 @@ class RAGEngine:
 # ============================================================================
 
 class HuggingFaceLLM:
-    """Uses Hugging Face Inference API with the new router endpoint."""
-    def __init__(self, api_key):
-        self.api_key = api_key
-        # Zephyr 7B Beta (Free, high quality, not gated)
-        self.model = "HuggingFaceH4/zephyr-7b-beta"
-        # FIXED: Use the new router endpoint instead of deprecated api-inference
-        self.base_url = "https://router.huggingface.co/hf-inference/models"
+    """Uses Hugging Face Inference API with multiple endpoint fallbacks."""
     
-    def generate(self, messages, temperature=0.3):
-        prompt = self._format_messages(messages)
+    # List of endpoints to try in order
+    ENDPOINTS = [
+        "https://api-inference.huggingface.co/models",  # Original (might still work)
+        "https://router.huggingface.co/hf-inference/models",  # New router
+    ]
+    
+    # Models to try in order of preference
+    MODELS = [
+        "mistralai/Mistral-7B-Instruct-v0.2",
+        "HuggingFaceH4/zephyr-7b-beta",
+        "microsoft/DialoGPT-large",
+    ]
+    
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.working_endpoint = None
+        self.working_model = None
+        log_info(f"HuggingFaceLLM initialized with key: {api_key[:8]}..." if api_key else "HuggingFaceLLM initialized WITHOUT key")
+    
+    def _try_endpoint(self, url: str, prompt: str, temperature: float) -> tuple[bool, str]:
+        """Try a specific endpoint and return (success, result)"""
+        log_debug(f"Trying endpoint: {url}")
         try:
-            # Construct the URL with the new router endpoint
-            url = f"{self.base_url}/{self.model}"
-            
             response = httpx.post(
                 url,
                 headers={
@@ -478,132 +521,308 @@ class HuggingFaceLLM:
                 timeout=60.0
             )
             
+            log_debug(f"Response status: {response.status_code}")
+            log_debug(f"Response headers: {dict(response.headers)}")
+            
             if response.status_code == 200:
                 result = response.json()
+                log_debug(f"Response JSON type: {type(result)}")
+                
                 if isinstance(result, list) and len(result) > 0:
-                    return result[0].get("generated_text", "").strip()
+                    text = result[0].get("generated_text", "").strip()
+                    if text:
+                        return True, text
                 elif isinstance(result, dict):
-                    # Handle different response formats
                     if "generated_text" in result:
-                        return result["generated_text"].strip()
-                    elif "error" in result:
-                        return f"❌ API Error: {result['error']}"
-                return str(result)
+                        return True, result["generated_text"].strip()
+                    if "error" in result:
+                        log_warning(f"API returned error: {result['error']}")
+                        return False, f"API Error: {result['error']}"
+                
+                return True, str(result)
+            
             elif response.status_code == 503:
-                # Model is loading
-                error_data = response.json() if response.text else {}
+                error_data = {}
+                try:
+                    error_data = response.json()
+                except:
+                    pass
                 estimated_time = error_data.get("estimated_time", 30)
-                return f"⏳ Model is loading on HuggingFace... try again in {int(estimated_time)}s."
+                log_info(f"Model loading, estimated time: {estimated_time}s")
+                return False, f"⏳ Model is loading... try again in {int(estimated_time)}s"
+            
             elif response.status_code == 404:
-                return f"❌ Error 404: Model not found. URL tried: {url}"
+                log_warning(f"404 at {url}")
+                return False, f"404: Endpoint not found"
+            
             elif response.status_code == 401:
-                return "❌ Error 401: Unauthorized. Please check your Hugging Face API Key."
+                log_error("401 Unauthorized - check API key")
+                return False, "❌ Unauthorized - check your HuggingFace API key"
+            
             elif response.status_code == 429:
-                return "❌ Error 429: Rate limit exceeded. Please wait a moment and try again."
-            elif response.status_code == 422:
-                # Validation error - often means the model doesn't support certain parameters
-                error_detail = response.json().get("error", response.text[:200])
-                return f"❌ Error 422: Validation error - {error_detail}"
+                log_warning("Rate limited")
+                return False, "❌ Rate limited - please wait and try again"
+            
             else:
-                return f"Error {response.status_code}: {response.text[:200]}"
+                log_warning(f"Unexpected status {response.status_code}: {response.text[:200]}")
+                return False, f"Error {response.status_code}: {response.text[:200]}"
+                
         except httpx.TimeoutException:
-            return "❌ Request timed out. The model may be under heavy load. Please try again."
-        except httpx.ConnectError:
-            return "❌ Connection error. Please check your internet connection."
+            log_error(f"Timeout at {url}")
+            return False, "Timeout"
+        except httpx.ConnectError as e:
+            log_error(f"Connection error at {url}: {e}")
+            return False, f"Connection error: {e}"
         except Exception as e:
-            return f"Connection error: {e}"
+            log_error(f"Exception at {url}: {e}")
+            return False, str(e)
+    
+    def generate(self, messages: List[Dict], temperature: float = 0.3) -> str:
+        prompt = self._format_messages(messages)
+        log_debug(f"Formatted prompt length: {len(prompt)} chars")
+        
+        # If we found a working endpoint before, try it first
+        if self.working_endpoint and self.working_model:
+            url = f"{self.working_endpoint}/{self.working_model}"
+            success, result = self._try_endpoint(url, prompt, temperature)
+            if success:
+                return result
+            log_warning(f"Previously working endpoint failed, trying alternatives...")
+        
+        # Try all combinations
+        errors = []
+        for endpoint in self.ENDPOINTS:
+            for model in self.MODELS:
+                url = f"{endpoint}/{model}"
+                log_info(f"Attempting: {url}")
+                
+                success, result = self._try_endpoint(url, prompt, temperature)
+                
+                if success:
+                    # Remember this working combination
+                    self.working_endpoint = endpoint
+                    self.working_model = model
+                    log_info(f"Success with {endpoint} / {model}")
+                    return result
+                else:
+                    errors.append(f"{model}: {result}")
+        
+        # All failed
+        error_summary = "\n".join(errors[-3:])  # Show last 3 errors
+        log_error(f"All endpoints failed. Last errors:\n{error_summary}")
+        return f"❌ All HuggingFace endpoints failed.\n\nLast errors:\n{error_summary}\n\n**Suggestion:** Try using OpenAI or xAI instead."
 
-    def stream(self, messages, temperature=0.3):
-        # HF Inference API free tier doesn't support easy streaming
-        # Return the full response as a single chunk
+    def stream(self, messages: List[Dict], temperature: float = 0.3):
+        """HF free tier doesn't support streaming well, return full response"""
         full_response = self.generate(messages, temperature)
         yield full_response
 
-    def _format_messages(self, messages):
-        # Zephyr Chat Template
+    def _format_messages(self, messages: List[Dict]) -> str:
+        """Format messages for Mistral/Zephyr style models"""
         out = ""
         for m in messages:
-            if m["role"] == "user":
-                out += f"<|user|>\n{m['content']}</s>\n"
-            elif m["role"] == "assistant":
-                out += f"<|assistant|>\n{m['content']}</s>\n"
-            elif m["role"] == "system":
-                out += f"<|system|>\n{m['content']}</s>\n"
+            role = m["role"]
+            content = m["content"]
+            
+            if role == "system":
+                out += f"<|system|>\n{content}</s>\n"
+            elif role == "user":
+                out += f"<|user|>\n{content}</s>\n"
+            elif role == "assistant":
+                out += f"<|assistant|>\n{content}</s>\n"
+        
         out += "<|assistant|>\n"
         return out
 
 
 class OpenAILLM:
-    def __init__(self, api_key):
+    def __init__(self, api_key: str):
         self.api_key = api_key
         self.model = "gpt-4o-mini"
+        log_info(f"OpenAILLM initialized with key: {api_key[:8]}..." if api_key else "OpenAILLM initialized WITHOUT key")
     
-    def generate(self, messages, temperature=0.3):
+    def generate(self, messages: List[Dict], temperature: float = 0.3) -> str:
+        log_debug(f"OpenAI generate called with {len(messages)} messages")
         try:
             response = httpx.post(
                 "https://api.openai.com/v1/chat/completions",
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                json={"model": self.model, "messages": messages, "temperature": temperature},
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": self.model,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "max_tokens": 1500
+                },
                 timeout=60.0
             )
-            response.raise_for_status()
-            return response.json()["choices"][0]["message"]["content"]
+            
+            log_debug(f"OpenAI response status: {response.status_code}")
+            
+            if response.status_code == 200:
+                result = response.json()
+                return result["choices"][0]["message"]["content"]
+            else:
+                log_error(f"OpenAI error: {response.status_code} - {response.text[:200]}")
+                return f"OpenAI Error {response.status_code}: {response.text[:200]}"
+                
         except Exception as e:
+            log_error(f"OpenAI exception: {e}")
             return f"OpenAI Error: {e}"
 
-    def stream(self, messages, temperature=0.3):
+    def stream(self, messages: List[Dict], temperature: float = 0.3):
+        log_debug("OpenAI stream called")
         try:
             with httpx.stream(
-                "POST", "https://api.openai.com/v1/chat/completions",
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                json={"model": self.model, "messages": messages, "temperature": temperature, "stream": True, "max_tokens": 1500},
+                "POST",
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": self.model,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "stream": True,
+                    "max_tokens": 1500
+                },
                 timeout=60.0
             ) as response:
                 for line in response.iter_lines():
                     if line.startswith("data: ") and line != "data: [DONE]":
                         try:
-                            content = json.loads(line[6:])["choices"][0]["delta"].get("content", "")
-                            if content: yield content
-                        except: continue
+                            data = json.loads(line[6:])
+                            content = data["choices"][0]["delta"].get("content", "")
+                            if content:
+                                yield content
+                        except:
+                            continue
         except Exception as e:
+            log_error(f"OpenAI stream error: {e}")
             yield f"Error: {e}"
 
 
 class XaiLLM:
-    def __init__(self, api_key):
+    def __init__(self, api_key: str):
         self.api_key = api_key
         self.model = "grok-beta"
         self.base_url = "https://api.x.ai/v1"
+        log_info(f"XaiLLM initialized with key: {api_key[:8]}..." if api_key else "XaiLLM initialized WITHOUT key")
 
-    def generate(self, messages, temperature=0.3):
+    def generate(self, messages: List[Dict], temperature: float = 0.3) -> str:
+        log_debug(f"xAI generate called with {len(messages)} messages")
         try:
             response = httpx.post(
                 f"{self.base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                json={"model": self.model, "messages": messages, "temperature": temperature},
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": self.model,
+                    "messages": messages,
+                    "temperature": temperature
+                },
                 timeout=60.0
             )
-            response.raise_for_status()
-            return response.json()["choices"][0]["message"]["content"]
+            
+            log_debug(f"xAI response status: {response.status_code}")
+            
+            if response.status_code == 200:
+                return response.json()["choices"][0]["message"]["content"]
+            else:
+                log_error(f"xAI error: {response.status_code} - {response.text[:200]}")
+                return f"xAI Error {response.status_code}: {response.text[:200]}"
+                
         except Exception as e:
+            log_error(f"xAI exception: {e}")
             return f"xAI Error: {e}"
 
-    def stream(self, messages, temperature=0.3):
+    def stream(self, messages: List[Dict], temperature: float = 0.3):
+        log_debug("xAI stream called")
         try:
             with httpx.stream(
-                "POST", f"{self.base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                json={"model": self.model, "messages": messages, "temperature": temperature, "stream": True},
+                "POST",
+                f"{self.base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": self.model,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "stream": True
+                },
                 timeout=60.0
             ) as response:
                 for line in response.iter_lines():
                     if line.startswith("data: ") and line != "data: [DONE]":
                         try:
-                            content = json.loads(line[6:])["choices"][0]["delta"].get("content", "")
-                            if content: yield content
-                        except: continue
+                            data = json.loads(line[6:])
+                            content = data["choices"][0]["delta"].get("content", "")
+                            if content:
+                                yield content
+                        except:
+                            continue
         except Exception as e:
+            log_error(f"xAI stream error: {e}")
             yield f"Error: {e}"
+
+
+# ============================================================================
+# HELPER: Get API Key with logging
+# ============================================================================
+
+def get_secret(key_name: str) -> Optional[str]:
+    """Safely get a secret with logging"""
+    try:
+        # Try st.secrets first
+        if hasattr(st, 'secrets'):
+            # Try direct access
+            if key_name in st.secrets:
+                value = st.secrets[key_name]
+                log_debug(f"Found secret '{key_name}' in st.secrets")
+                return value
+            
+            # Try nested access (e.g., secrets.toml with sections)
+            for section in st.secrets:
+                if isinstance(st.secrets[section], dict) and key_name in st.secrets[section]:
+                    value = st.secrets[section][key_name]
+                    log_debug(f"Found secret '{key_name}' in st.secrets[{section}]")
+                    return value
+        
+        # Try environment variable
+        value = os.environ.get(key_name)
+        if value:
+            log_debug(f"Found '{key_name}' in environment variables")
+            return value
+        
+        log_debug(f"Secret '{key_name}' not found")
+        return None
+        
+    except Exception as e:
+        log_warning(f"Error getting secret '{key_name}': {e}")
+        return None
+
+
+def list_available_secrets() -> List[str]:
+    """List all available secret keys for debugging"""
+    secrets = []
+    try:
+        if hasattr(st, 'secrets'):
+            for key in st.secrets:
+                if isinstance(st.secrets[key], dict):
+                    for subkey in st.secrets[key]:
+                        secrets.append(f"{key}.{subkey}")
+                else:
+                    secrets.append(key)
+    except Exception as e:
+        log_warning(f"Error listing secrets: {e}")
+    return secrets
 
 
 # ============================================================================
@@ -614,10 +833,21 @@ def main():
     st.set_page_config(page_title="D2L API Helper", page_icon="📚", layout="wide")
     st.title("📚 D2L Brightspace API Assistant")
 
+    # Initialize debug logs
+    if "debug_logs" not in st.session_state:
+        st.session_state.debug_logs = []
+    
     # Session State Init
-    if "messages" not in st.session_state: st.session_state.messages = []
-    if "kb_ready" not in st.session_state: st.session_state.kb_ready = False
-    if "kb_metadata" not in st.session_state: st.session_state.kb_metadata = {}
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+    if "kb_ready" not in st.session_state:
+        st.session_state.kb_ready = False
+    if "kb_metadata" not in st.session_state:
+        st.session_state.kb_metadata = {}
+    if "last_query" not in st.session_state:
+        st.session_state.last_query = ""
+
+    log_debug("Main app started")
 
     # 1. Initialize Knowledge Base
     if not st.session_state.kb_ready:
@@ -635,56 +865,140 @@ def main():
     # 2. Init RAG
     if "rag" not in st.session_state:
         st.session_state.rag = RAGEngine()
+        log_debug("RAG Engine initialized")
 
     # Sidebar Settings
     with st.sidebar:
         st.header("⚙️ Settings")
         
         if st.session_state.kb_metadata:
-             pages = st.session_state.kb_metadata.get('pages_count', '?')
-             chunks = st.session_state.kb_metadata.get('chunks_count', '?')
-             st.success(f"KB Loaded: {pages} pages / {chunks} chunks")
+            pages = st.session_state.kb_metadata.get('pages_count', '?')
+            chunks = st.session_state.kb_metadata.get('chunks_count', '?')
+            st.success(f"KB Loaded: {pages} pages / {chunks} chunks")
 
-        persona = st.radio("Style:", ["developer", "plain"], format_func=lambda x: "👨‍💻 Developer" if x == "developer" else "📝 Plain English")
+        persona = st.radio(
+            "Response Style:",
+            ["developer", "plain"],
+            format_func=lambda x: "👨‍💻 Developer" if x == "developer" else "📝 Plain English"
+        )
+        
         st.divider()
         
-        model_choice = st.selectbox("Model:", ["huggingface", "openai", "xai"], format_func=lambda x: {"huggingface": "Zephyr 7B (Hugging Face)", "openai": "GPT-4o (OpenAI)", "xai": "Grok (xAI)"}[x])
+        # Model Selection
+        model_choice = st.selectbox(
+            "Model:",
+            ["huggingface", "openai", "xai"],
+            format_func=lambda x: {
+                "huggingface": "🤗 HuggingFace (Free)",
+                "openai": "🧠 GPT-4o-mini (OpenAI)",
+                "xai": "🚀 Grok (xAI)"
+            }[x]
+        )
+        
+        log_debug(f"Selected model: {model_choice}")
         
         api_key = None
+        auth_valid = False
         
-        # KEY HANDLING LOGIC
+        # KEY HANDLING LOGIC - FIXED
         if model_choice == "huggingface":
-            # Attempt to load from secrets, otherwise ask user
-            api_key = st.secrets.get("HUGGINGFACE_API_KEY")
-            if not api_key:
-                api_key = st.text_input("Hugging Face API Key (Required for 'Free' tier):", type="password", help="Get a free key at huggingface.co/settings/tokens")
-            if api_key: st.success("Key provided")
-        else:
-            # Paid models
-            pwd = st.text_input("Access Password:", type="password")
-            if pwd == st.secrets.get("MODEL_PASSWORD", "password"):
-                api_key = st.secrets.get(f"{model_choice.upper()}_API_KEY")
-                if api_key: st.success("Authenticated")
+            # Try to get from secrets first
+            api_key = get_secret("HUGGINGFACE_API_KEY") or get_secret("HF_API_KEY")
+            
+            if api_key:
+                st.success("✅ HuggingFace key loaded from secrets")
+                auth_valid = True
             else:
-                st.warning("Enter password to use premium models")
-                model_choice = None # invalid
+                # Ask user for key
+                api_key = st.text_input(
+                    "HuggingFace API Key:",
+                    type="password",
+                    help="Get a free key at huggingface.co/settings/tokens"
+                )
+                if api_key:
+                    st.success("✅ Key provided")
+                    auth_valid = True
+                else:
+                    st.warning("⚠️ Please enter your HuggingFace API key")
+                    auth_valid = False
+                    
+        elif model_choice in ["openai", "xai"]:
+            # Premium models need password
+            pwd = st.text_input("Access Password:", type="password")
+            expected_pwd = get_secret("MODEL_PASSWORD") or "password"
+            
+            if pwd == expected_pwd:
+                key_name = f"{model_choice.upper()}_API_KEY"
+                api_key = get_secret(key_name)
+                
+                if api_key:
+                    st.success(f"✅ Authenticated - {model_choice.upper()} key loaded")
+                    auth_valid = True
+                else:
+                    st.error(f"❌ {key_name} not found in secrets")
+                    auth_valid = False
+            elif pwd:
+                st.error("❌ Invalid password")
+                auth_valid = False
+            else:
+                st.info("🔒 Enter password for premium models")
+                auth_valid = False
 
         st.divider()
+        
         if st.button("🗑️ Clear Chat"):
             st.session_state.messages = []
+            st.session_state.last_query = ""
+            log_info("Chat cleared")
             st.rerun()
 
-        with st.expander("Admin Tools"):
-            admin_pw = st.text_input("Admin PW:", type="password")
-            if st.button("🔄 Refresh DB") and admin_pw == st.secrets.get("ADMIN_PASSWORD", "admin"):
-                st.session_state.kb_ready = False
-                del st.session_state.rag
-                build_knowledge_base(force_rebuild=True)
+        # Debug Panel
+        with st.expander("🔧 Debug Panel"):
+            st.write("**Session State Keys:**")
+            st.code(list(st.session_state.keys()))
+            
+            st.write("**Available Secrets:**")
+            secrets_list = list_available_secrets()
+            if secrets_list:
+                st.code(secrets_list)
+            else:
+                st.warning("No secrets found")
+            
+            st.write("**Auth Status:**")
+            st.write(f"- model_choice: `{model_choice}`")
+            st.write(f"- auth_valid: `{auth_valid}`")
+            st.write(f"- api_key exists: `{bool(api_key)}`")
+            if api_key:
+                st.write(f"- api_key preview: `{api_key[:8]}...`")
+            
+            st.write("**Recent Logs:**")
+            if st.session_state.debug_logs:
+                for log_entry in st.session_state.debug_logs[-20:]:
+                    st.text(log_entry)
+            else:
+                st.info("No logs yet")
+            
+            if st.button("Clear Logs"):
+                st.session_state.debug_logs = []
                 st.rerun()
+
+        # Admin Tools
+        with st.expander("🔐 Admin Tools"):
+            admin_pw = st.text_input("Admin Password:", type="password", key="admin_pw")
+            expected_admin = get_secret("ADMIN_PASSWORD") or "admin"
+            
+            if st.button("🔄 Refresh DB"):
+                if admin_pw == expected_admin:
+                    st.session_state.kb_ready = False
+                    if "rag" in st.session_state:
+                        del st.session_state.rag
+                    build_knowledge_base(force_rebuild=True)
+                    st.rerun()
+                else:
+                    st.error("Invalid admin password")
             
             st.divider()
             
-            # Diagnostic: Show what's in the DB
             if st.button("🔍 Diagnose DB"):
                 try:
                     client = chromadb.PersistentClient(path=CHROMA_DIR)
@@ -701,89 +1015,99 @@ def main():
                         urls.add(m.get("source_url", ""))
                         
                     st.write("### Database Stats")
-                    st.write(f"**Total Pages:** {len(urls)}")
+                    st.write(f"**Total Chunks:** {collection.count()}")
+                    st.write(f"**Unique Pages:** {len(urls)}")
                     st.write("**Categories:**")
                     st.json(categories)
                 except Exception as e:
                     st.error(f"Error: {e}")
-            
-            # Diagnostic: Scan for missing pages
-            if st.button("🔎 Scan Missing Pages"):
-                with st.spinner("Scanning..."):
-                    try:
-                        scan_client = httpx.Client(timeout=10)
-                        resp = scan_client.get(BASE_URL)
-                        soup = BeautifulSoup(resp.text, "html.parser")
-                        site_urls = set()
-                        for a in soup.find_all("a", href=True):
-                             href = a["href"]
-                             if not href.startswith("#") and "mailto" not in href:
-                                 full = urljoin(BASE_URL, href)
-                                 if "docs.valence.desire2learn.com" in full:
-                                     site_urls.add(full.split("#")[0])
-                        
-                        client = chromadb.PersistentClient(path=CHROMA_DIR)
-                        embedding_fn = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
-                        collection = client.get_collection(name=COLLECTION_NAME, embedding_function=embedding_fn)
-                        db_data = collection.get(include=["metadatas"])
-                        db_urls = set(m.get("source_url", "") for m in db_data["metadatas"])
-                        
-                        missing = [u for u in site_urls if u not in db_urls and u.endswith(".html")]
-                        
-                        if missing:
-                            st.warning(f"Found {len(missing)} missing pages.")
-                            with st.expander("Show Missing"):
-                                for m in missing[:50]: st.write(m)
-                        else:
-                            st.success("All linked pages appear to be indexed.")
-                    except Exception as e:
-                        st.error(f"Scan failed: {e}")
 
     # Chat Interface
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
-            if "sources" in msg and msg["sources"]:
+            if msg["role"] == "assistant" and "sources" in msg and msg["sources"]:
                 with st.expander(f"📚 Sources ({len(msg['sources'])})"):
                     for s in msg["sources"]:
                         st.markdown(f"- [{s['title']}]({s['url']})")
 
+    # Chat Input
     if prompt := st.chat_input("How do I get a user's enrolled courses?"):
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"): st.markdown(prompt)
+        # Prevent duplicate processing
+        if prompt == st.session_state.last_query:
+            log_warning("Duplicate query detected, skipping")
+        else:
+            st.session_state.last_query = prompt
+            log_info(f"New query: {prompt[:50]}...")
+            
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
 
-        # Check for Key
-        if not api_key:
-            st.error(f"Please provide an API Key for {model_choice} in the sidebar.")
-            st.stop()
+            # Check authentication
+            if not auth_valid or not api_key:
+                with st.chat_message("assistant"):
+                    error_msg = f"⚠️ Please configure authentication for **{model_choice}** in the sidebar."
+                    st.error(error_msg)
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": error_msg,
+                        "sources": []
+                    })
+                st.stop()
 
-        with st.chat_message("assistant"):
-            with st.spinner("Searching docs..."):
-                chunks = st.session_state.rag.retrieve(prompt)
-                sources = st.session_state.rag.get_sources(chunks)
-                
-                if model_choice == "openai": llm = OpenAILLM(api_key)
-                elif model_choice == "xai": llm = XaiLLM(api_key)
-                else: llm = HuggingFaceLLM(api_key)
-                
-                history = [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages[:-1]]
-                messages = st.session_state.rag.build_messages(prompt, chunks, persona, history)
-                
-                response_placeholder = st.empty()
-                full_response = ""
-                
-                stream = llm.stream(messages)
-                for chunk in stream:
-                    full_response += chunk
-                    response_placeholder.markdown(full_response + "▌")
-                
-                response_placeholder.markdown(full_response)
-                
-                st.session_state.messages.append({
-                    "role": "assistant", 
-                    "content": full_response,
-                    "sources": sources
-                })
+            with st.chat_message("assistant"):
+                with st.spinner("🔍 Searching documentation..."):
+                    chunks = st.session_state.rag.retrieve(prompt)
+                    sources = st.session_state.rag.get_sources(chunks)
+                    log_debug(f"Found {len(chunks)} relevant chunks")
+                    
+                    # Create LLM instance
+                    if model_choice == "openai":
+                        llm = OpenAILLM(api_key)
+                    elif model_choice == "xai":
+                        llm = XaiLLM(api_key)
+                    else:
+                        llm = HuggingFaceLLM(api_key)
+                    
+                    # Build conversation
+                    history = [
+                        {"role": m["role"], "content": m["content"]}
+                        for m in st.session_state.messages[:-1]
+                    ]
+                    messages = st.session_state.rag.build_messages(prompt, chunks, persona, history)
+                    
+                    log_debug(f"Sending {len(messages)} messages to {model_choice}")
+                    
+                    # Generate response
+                    response_placeholder = st.empty()
+                    full_response = ""
+                    
+                    try:
+                        for chunk in llm.stream(messages):
+                            full_response += chunk
+                            response_placeholder.markdown(full_response + "▌")
+                        
+                        response_placeholder.markdown(full_response)
+                        log_info(f"Response generated: {len(full_response)} chars")
+                        
+                    except Exception as e:
+                        full_response = f"❌ Error generating response: {e}"
+                        response_placeholder.error(full_response)
+                        log_error(f"Generation error: {e}")
+                    
+                    st.session_state.messages.append({
+                        "role": "assistant",
+                        "content": full_response,
+                        "sources": sources
+                    })
+                    
+                    # Show sources
+                    if sources:
+                        with st.expander(f"📚 Sources ({len(sources)})"):
+                            for s in sources:
+                                st.markdown(f"- [{s['title']}]({s['url']})")
+
 
 if __name__ == "__main__":
     main()

@@ -7,9 +7,20 @@ Subsequent runs: Loads from cache
 Admin: Password-protected "Refresh Docs" button to re-scrape
 """
 
-__import__('pysqlite3')
 import sys
-sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
+import os
+
+# ============================================================================
+# CRITICAL FIX: SQLITE FOR STREAMLIT CLOUD
+# ============================================================================
+# ChromaDB requires a newer version of SQLite than what is installed by default
+# on Streamlit Cloud (Debian). We use pysqlite3-binary to override it.
+try:
+    __import__('pysqlite3')
+    sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
+except ImportError:
+    # If running locally without pysqlite3-binary, this passes silently
+    pass
 
 import streamlit as st
 import json
@@ -515,16 +526,17 @@ class RAGEngine:
 # ============================================================================
 
 class HuggingFaceLLM:
-    """Free LLM via HuggingFace Inference API."""
+    """Free LLM via HuggingFace Router."""
     def __init__(self):
         self.model = "mistralai/Mistral-7B-Instruct-v0.3"
-        self.base_url = "https://api-inference.huggingface.co/models"
+        # UPDATED: Use the Router URL
+        self.base_url = "https://router.huggingface.co/hf"
     
     def generate(self, messages, temperature=0.3):
         prompt = self._format_messages(messages)
         try:
             response = httpx.post(
-                f"{self.base_url}/{self.model}",
+                f"{self.base_url}/models/{self.model}",
                 headers={"Content-Type": "application/json"},
                 json={
                     "inputs": prompt,
@@ -646,17 +658,20 @@ class XaiLLM(OpenAILLM):
 
 def main():
     st.set_page_config(page_title="D2L API Helper", page_icon="📚", layout="wide")
-    st.title("📚 D2L / Brightspace API Assistant")
+    st.title("📚 D2L Brightspace API Assistant")
 
     # Session State Init
     if "messages" not in st.session_state: st.session_state.messages = []
     if "kb_ready" not in st.session_state: st.session_state.kb_ready = False
+    if "kb_metadata" not in st.session_state: st.session_state.kb_metadata = {}
 
     # 1. Initialize Knowledge Base
     if not st.session_state.kb_ready:
         st.info("🔍 Checking knowledge base...")
-        success, msg, _ = build_knowledge_base(force_rebuild=False)
+        success, msg, metadata = build_knowledge_base(force_rebuild=False)
         st.session_state.kb_ready = success
+        st.session_state.kb_metadata = metadata
+        
         if not success:
             if st.button("🔄 Try Rebuilding"):
                 build_knowledge_base(force_rebuild=True)
@@ -672,6 +687,12 @@ def main():
     with st.sidebar:
         st.header("⚙️ Settings")
         
+        # KB Stats
+        if st.session_state.kb_metadata:
+             pages = st.session_state.kb_metadata.get('pages_count', '?')
+             chunks = st.session_state.kb_metadata.get('chunks_count', '?')
+             st.success(f"Loaded: {pages} pages, {chunks} chunks")
+
         persona = st.radio("Style:", ["developer", "plain"], format_func=lambda x: "👨‍💻 Developer" if x == "developer" else "📝 Plain English")
         st.divider()
         
@@ -692,13 +713,70 @@ def main():
             st.session_state.messages = []
             st.rerun()
 
-        with st.expander("Admin"):
+        with st.expander("Admin Tools"):
             admin_pw = st.text_input("Admin PW:", type="password")
             if st.button("🔄 Refresh DB") and admin_pw == st.secrets.get("ADMIN_PASSWORD", "admin"):
                 st.session_state.kb_ready = False
                 del st.session_state.rag
                 build_knowledge_base(force_rebuild=True)
                 st.rerun()
+            
+            st.divider()
+            
+            # Diagnostic: Show what's in the DB
+            if st.button("🔍 Diagnose DB"):
+                try:
+                    client = chromadb.PersistentClient(path=CHROMA_DIR)
+                    embedding_fn = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+                    collection = client.get_collection(name=COLLECTION_NAME, embedding_function=embedding_fn)
+                    
+                    data = collection.get(include=["metadatas"])
+                    categories = {}
+                    urls = set()
+                    
+                    for m in data["metadatas"]:
+                        cat = m.get("category", "unknown")
+                        categories[cat] = categories.get(cat, 0) + 1
+                        urls.add(m.get("source_url", ""))
+                        
+                    st.write("### Database Stats")
+                    st.write(f"**Total Pages:** {len(urls)}")
+                    st.write("**Categories:**")
+                    st.json(categories)
+                except Exception as e:
+                    st.error(f"Error: {e}")
+            
+            # Diagnostic: Scan for missing pages
+            if st.button("🔎 Scan Missing Pages"):
+                with st.spinner("Scanning..."):
+                    try:
+                        scan_client = httpx.Client(timeout=10)
+                        resp = scan_client.get(BASE_URL)
+                        soup = BeautifulSoup(resp.text, "html.parser")
+                        site_urls = set()
+                        for a in soup.find_all("a", href=True):
+                             href = a["href"]
+                             if not href.startswith("#") and "mailto" not in href:
+                                 full = urljoin(BASE_URL, href)
+                                 if "docs.valence.desire2learn.com" in full:
+                                     site_urls.add(full.split("#")[0])
+                        
+                        client = chromadb.PersistentClient(path=CHROMA_DIR)
+                        embedding_fn = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+                        collection = client.get_collection(name=COLLECTION_NAME, embedding_function=embedding_fn)
+                        db_data = collection.get(include=["metadatas"])
+                        db_urls = set(m.get("source_url", "") for m in db_data["metadatas"])
+                        
+                        missing = [u for u in site_urls if u not in db_urls and u.endswith(".html")]
+                        
+                        if missing:
+                            st.warning(f"Found {len(missing)} missing pages.")
+                            with st.expander("Show Missing"):
+                                for m in missing[:50]: st.write(m)
+                        else:
+                            st.success("All linked pages appear to be indexed.")
+                    except Exception as e:
+                        st.error(f"Scan failed: {e}")
 
     # Chat Interface
     for msg in st.session_state.messages:

@@ -877,301 +877,106 @@ def debug_secrets():
 
 def main():
     st.set_page_config(page_title="D2L API Helper", page_icon="📚", layout="wide")
-    st.title("📚 D2L Brightspace API Assistant")
-
-    # Initialize debug logs
-    if "debug_logs" not in st.session_state:
-        st.session_state.debug_logs = []
+    st.title("📚 D2L Brightspace API Assistant - SECRET DIAGNOSTIC MODE")
     
-    # Session State Init
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-    if "kb_ready" not in st.session_state:
-        st.session_state.kb_ready = False
-    if "kb_metadata" not in st.session_state:
-        st.session_state.kb_metadata = {}
-    if "last_query" not in st.session_state:
-        st.session_state.last_query = ""
-
-    log_debug("Main app started")
-
-    # 1. Initialize Knowledge Base
-    if not st.session_state.kb_ready:
-        st.info("🔍 Checking knowledge base...")
-        success, msg, metadata = build_knowledge_base(force_rebuild=False)
-        st.session_state.kb_ready = success
-        st.session_state.kb_metadata = metadata
-        if not success:
-            if st.button("🔄 Try Rebuilding"):
-                build_knowledge_base(force_rebuild=True)
-                st.rerun()
-            st.stop()
-        st.rerun()
-
-    # 2. Init RAG
-    if "rag" not in st.session_state:
-        st.session_state.rag = RAGEngine()
-        log_debug("RAG Engine initialized")
-
-    # Sidebar Settings
-    with st.sidebar:
-        st.header("⚙️ Settings")
-        
-        if st.session_state.kb_metadata:
-            pages = st.session_state.kb_metadata.get('pages_count', '?')
-            chunks = st.session_state.kb_metadata.get('chunks_count', '?')
-            st.success(f"KB Loaded: {pages} pages / {chunks} chunks")
-
-        persona = st.radio(
-            "Response Style:",
-            ["developer", "plain"],
-            format_func=lambda x: "👨‍💻 Developer" if x == "developer" else "📝 Plain English"
-        )
-        
-        st.divider()
-        
-        # Model Selection
-        model_choice = st.selectbox(
-            "Model:",
-            ["openai", "xai", "huggingface"],
-            format_func=lambda x: {
-                "huggingface": "🤗 HuggingFace (Free - May be slow)",
-                "openai": "🧠 GPT-4o-mini (OpenAI)",
-                "xai": "🚀 Grok (xAI)"
-            }[x]
-        )
-        
-        log_debug(f"Selected model: {model_choice}")
-        
-        # Initialize variables
-        api_key = None
-        auth_valid = False
-        
-        # Get the MODEL_PASSWORD from secrets for comparison
-        stored_password = get_secret("MODEL_PASSWORD")
-        log_debug(f"Stored password found: {bool(stored_password)}")
-        
-        # KEY HANDLING LOGIC - FIXED
-        if model_choice == "huggingface":
-            # HuggingFace - try secrets first, then ask user
-            api_key = get_secret("HUGGINGFACE_API_KEY")
-            
-            if api_key:
-                st.success("✅ HuggingFace key loaded from secrets")
-                auth_valid = True
-            else:
-                api_key = st.text_input(
-                    "HuggingFace API Key:",
-                    type="password",
-                    help="Get a free key at huggingface.co/settings/tokens",
-                    key="hf_key_input"
-                )
-                if api_key and len(api_key) > 10:
-                    st.success("✅ Key provided")
-                    auth_valid = True
-                else:
-                    st.warning("⚠️ Please enter your HuggingFace API key")
-                    auth_valid = False
-                    
-        elif model_choice in ["openai", "xai"]:
-            # OpenAI and xAI need password authentication
-            pwd = st.text_input(
-                "Access Password:", 
-                type="password",
-                key="model_password_input",
-                help="Enter the password to access premium models"
-            )
-            
-            if pwd:
-                # Compare passwords
-                if stored_password and pwd.strip() == stored_password.strip():
-                    log_debug("Password matched!")
-                    
-                    # Get the appropriate API key
-                    if model_choice == "openai":
-                        api_key = get_secret("OPENAI_API_KEY")
-                    else:
-                        api_key = get_secret("XAI_API_KEY")
-                    
-                    if api_key:
-                        st.success(f"✅ Authenticated - {model_choice.upper()} ready")
-                        auth_valid = True
-                        log_debug(f"API key loaded for {model_choice}: {api_key[:10]}...")
-                    else:
-                        st.error(f"❌ {model_choice.upper()}_API_KEY not found in secrets")
-                        log_error(f"API key not found for {model_choice}")
-                        auth_valid = False
-                else:
-                    st.error("❌ Invalid password")
-                    log_debug(f"Password mismatch. Entered: '{pwd[:3]}...' Expected: '{stored_password[:3] if stored_password else 'None'}...'")
-                    auth_valid = False
-            else:
-                st.info("🔒 Enter password for premium models")
-                auth_valid = False
-
-        st.divider()
-        
-        if st.button("🗑️ Clear Chat"):
-            st.session_state.messages = []
-            st.session_state.last_query = ""
-            log_info("Chat cleared")
-            st.rerun()
-
-        # Debug Panel - ENHANCED
-        with st.expander("🔧 Debug Panel"):
-            st.write("**Secrets Debug:**")
-            secrets_debug = debug_secrets()
-            st.json(secrets_debug)
-            
-            st.write("**Current Auth State:**")
-            st.write(f"- model_choice: `{model_choice}`")
-            st.write(f"- auth_valid: `{auth_valid}`")
-            st.write(f"- api_key exists: `{bool(api_key)}`")
-            if api_key:
-                st.write(f"- api_key preview: `{api_key[:10]}...`")
-            
-            st.write("**Recent Logs:**")
-            if st.session_state.debug_logs:
-                for log_entry in st.session_state.debug_logs[-15:]:
-                    st.text(log_entry)
-            else:
-                st.info("No logs yet")
-            
-            if st.button("Clear Logs"):
-                st.session_state.debug_logs = []
-                st.rerun()
-
-        # Admin Tools
-        with st.expander("🔐 Admin Tools"):
-            admin_pw = st.text_input("Admin Password:", type="password", key="admin_pw")
-            expected_admin = get_secret("ADMIN_PASSWORD")
-            
-            if st.button("🔄 Refresh DB"):
-                if expected_admin and admin_pw == expected_admin:
-                    st.session_state.kb_ready = False
-                    if "rag" in st.session_state:
-                        del st.session_state.rag
-                    build_knowledge_base(force_rebuild=True)
-                    st.rerun()
-                else:
-                    st.error("Invalid admin password")
-            
-            st.divider()
-            
-            if st.button("🔍 Diagnose DB"):
-                try:
-                    client = chromadb.PersistentClient(path=CHROMA_DIR)
-                    embedding_fn = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
-                    collection = client.get_collection(name=COLLECTION_NAME, embedding_function=embedding_fn)
-                    
-                    data = collection.get(include=["metadatas"])
-                    categories = {}
-                    urls = set()
-                    
-                    for m in data["metadatas"]:
-                        cat = m.get("category", "unknown")
-                        categories[cat] = categories.get(cat, 0) + 1
-                        urls.add(m.get("source_url", ""))
-                        
-                    st.write("### Database Stats")
-                    st.write(f"**Total Chunks:** {collection.count()}")
-                    st.write(f"**Unique Pages:** {len(urls)}")
-                    st.write("**Categories:**")
-                    st.json(categories)
-                except Exception as e:
-                    st.error(f"Error: {e}")
-
-    # Chat Interface
-    for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-            if msg["role"] == "assistant" and "sources" in msg and msg["sources"]:
-                with st.expander(f"📚 Sources ({len(msg['sources'])})"):
-                    for s in msg["sources"]:
-                        st.markdown(f"- [{s['title']}]({s['url']})")
-
-    # Chat Input
-    if prompt := st.chat_input("How do I get a user's enrolled courses?"):
-        # Prevent duplicate processing
-        if prompt == st.session_state.last_query:
-            log_warning("Duplicate query detected, skipping")
+    st.warning("🔧 DIAGNOSTIC MODE - This will show what secrets are actually loaded")
+    
+    st.write("## Step 1: Check if st.secrets exists")
+    st.write(f"**hasattr(st, 'secrets'):** {hasattr(st, 'secrets')}")
+    
+    if not hasattr(st, 'secrets'):
+        st.error("❌ st.secrets does not exist! Secrets not configured.")
+        st.stop()
+    
+    st.write("## Step 2: Inspect st.secrets object")
+    st.write(f"**Type:** {type(st.secrets)}")
+    
+    try:
+        st.write(f"**Has keys() method:** {hasattr(st.secrets, 'keys')}")
+        if hasattr(st.secrets, 'keys'):
+            keys = list(st.secrets.keys())
+            st.write(f"**Keys found:** {keys}")
         else:
-            st.session_state.last_query = prompt
-            log_info(f"New query: {prompt[:50]}...")
-            
-            st.session_state.messages.append({"role": "user", "content": prompt})
-            with st.chat_message("user"):
-                st.markdown(prompt)
-
-            # Check authentication
-            if not auth_valid or not api_key:
-                with st.chat_message("assistant"):
-                    if model_choice == "huggingface":
-                        error_msg = "⚠️ Please enter your HuggingFace API key in the sidebar."
-                    else:
-                        error_msg = f"⚠️ Please enter the correct password to use **{model_choice.upper()}**."
-                    st.error(error_msg)
-                    st.session_state.messages.append({
-                        "role": "assistant",
-                        "content": error_msg,
-                        "sources": []
-                    })
-                st.stop()
-
-            with st.chat_message("assistant"):
-                with st.spinner("🔍 Searching documentation..."):
-                    chunks = st.session_state.rag.retrieve(prompt)
-                    sources = st.session_state.rag.get_sources(chunks)
-                    log_debug(f"Found {len(chunks)} relevant chunks")
+            st.write("**Keys:** Cannot list (no keys() method)")
+    except Exception as e:
+        st.error(f"Error listing keys: {e}")
+    
+    st.write("## Step 3: Try to access each expected secret")
+    
+    expected_secrets = [
+        "HUGGINGFACE_API_KEY",
+        "OPENAI_API_KEY", 
+        "XAI_API_KEY",
+        "MODEL_PASSWORD",
+        "ADMIN_PASSWORD"
+    ]
+    
+    results = {}
+    
+    for secret_name in expected_secrets:
+        st.write(f"### Testing: `{secret_name}`")
+        
+        # Method 1: Direct bracket access
+        try:
+            value = st.secrets[secret_name]
+            results[secret_name] = {
+                "method": "st.secrets[key]",
+                "found": True,
+                "value_preview": f"{str(value)[:8]}..." if value else "None",
+                "value_type": type(value).__name__,
+                "value_length": len(str(value)) if value else 0
+            }
+            st.success(f"✅ Found via `st.secrets['{secret_name}']`: `{str(value)[:8]}...` (type: {type(value).__name__}, length: {len(str(value))})")
+        except KeyError:
+            results[secret_name] = {"method": "st.secrets[key]", "found": False, "error": "KeyError"}
+            st.error(f"❌ Not found via `st.secrets['{secret_name}']` (KeyError)")
+        except Exception as e:
+            results[secret_name] = {"method": "st.secrets[key]", "found": False, "error": str(e)}
+            st.error(f"❌ Error: {e}")
+    
+    st.write("## Step 4: Summary")
+    st.json(results)
+    
+    st.write("## Step 5: Check for nested structure")
+    try:
+        all_keys = list(st.secrets.keys()) if hasattr(st.secrets, 'keys') else []
+        st.write(f"**Top-level keys:** {all_keys}")
+        
+        for key in all_keys:
+            try:
+                val = st.secrets[key]
+                st.write(f"- **{key}**: type = {type(val).__name__}")
+                
+                # If it's a dict or has keys, show sub-keys
+                if isinstance(val, dict) or hasattr(val, 'keys'):
+                    sub_keys = list(val.keys()) if hasattr(val, 'keys') else list(val.keys())
+                    st.write(f"  - Sub-keys: {sub_keys}")
                     
-                    # Create LLM instance
-                    log_info(f"Creating {model_choice} LLM with key: {api_key[:10]}...")
-                    
-                    if model_choice == "openai":
-                        llm = OpenAILLM(api_key)
-                    elif model_choice == "xai":
-                        llm = XaiLLM(api_key)
-                    else:
-                        llm = HuggingFaceLLM(api_key)
-                    
-                    # Build conversation
-                    history = [
-                        {"role": m["role"], "content": m["content"]}
-                        for m in st.session_state.messages[:-1]
-                    ]
-                    messages = st.session_state.rag.build_messages(prompt, chunks, persona, history)
-                    
-                    log_debug(f"Sending {len(messages)} messages to {model_choice}")
-                    
-                    # Generate response
-                    response_placeholder = st.empty()
-                    full_response = ""
-                    
-                    try:
-                        for chunk in llm.stream(messages):
-                            full_response += chunk
-                            response_placeholder.markdown(full_response + "▌")
-                        
-                        response_placeholder.markdown(full_response)
-                        log_info(f"Response generated: {len(full_response)} chars")
-                        
-                    except Exception as e:
-                        full_response = f"❌ Error generating response: {e}"
-                        response_placeholder.error(full_response)
-                        log_error(f"Generation error: {e}")
-                    
-                    st.session_state.messages.append({
-                        "role": "assistant",
-                        "content": full_response,
-                        "sources": sources
-                    })
-                    
-                    # Show sources
-                    if sources:
-                        with st.expander(f"📚 Sources ({len(sources)})"):
-                            for s in sources:
-                                st.markdown(f"- [{s['title']}]({s['url']})")
-
-
-if __name__ == "__main__":
-    main()
+            except Exception as e:
+                st.write(f"- **{key}**: Error accessing - {e}")
+                
+    except Exception as e:
+        st.error(f"Cannot iterate secrets: {e}")
+    
+    st.write("---")
+    st.write("## 📋 Instructions")
+    st.info("""
+    **Based on the results above:**
+    
+    1. Check "Step 3" - which secrets were found?
+    2. Check "Step 5" - is there a nested structure?
+    3. Copy the entire output and share it
+    
+    **Expected Streamlit Cloud secrets format:**
+    ```toml
+    HUGGINGFACE_API_KEY = "hf_xxxxx"
+    OPENAI_API_KEY = "sk-xxxxx"
+    XAI_API_KEY = "xai-xxxxx"
+    MODEL_PASSWORD = "w0rdpass"
+    ADMIN_PASSWORD = "w0rdpass"
+    ```
+    
+    **No sections, no quotes around keys, quotes around string values.**
+    """)
+    
+    st.stop()

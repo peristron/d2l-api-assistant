@@ -447,18 +447,18 @@ class RAGEngine:
 # ============================================================================
 
 class HuggingFaceLLM:
-    """Uses Hugging Face Inference API. Requires an API Token."""
+    """Uses Hugging Face Inference API with the new router endpoint."""
     def __init__(self, api_key):
         self.api_key = api_key
-        # UPDATED: Zephyr 7B Beta (Free, high quality, not gated)
+        # Zephyr 7B Beta (Free, high quality, not gated)
         self.model = "HuggingFaceH4/zephyr-7b-beta"
-        # UPDATED: Standard Inference API URL (Works for Zephyr)
-        self.base_url = "https://api-inference.huggingface.co/models"
+        # FIXED: Use the new router endpoint instead of deprecated api-inference
+        self.base_url = "https://router.huggingface.co/hf-inference/models"
     
     def generate(self, messages, temperature=0.3):
         prompt = self._format_messages(messages)
         try:
-            # Construct standard inference URL
+            # Construct the URL with the new router endpoint
             url = f"{self.base_url}/{self.model}"
             
             response = httpx.post(
@@ -480,22 +480,42 @@ class HuggingFaceLLM:
             
             if response.status_code == 200:
                 result = response.json()
-                if isinstance(result, list):
+                if isinstance(result, list) and len(result) > 0:
                     return result[0].get("generated_text", "").strip()
+                elif isinstance(result, dict):
+                    # Handle different response formats
+                    if "generated_text" in result:
+                        return result["generated_text"].strip()
+                    elif "error" in result:
+                        return f"❌ API Error: {result['error']}"
                 return str(result)
             elif response.status_code == 503:
-                return "⏳ Model is loading on HuggingFace... try again in 30s."
+                # Model is loading
+                error_data = response.json() if response.text else {}
+                estimated_time = error_data.get("estimated_time", 30)
+                return f"⏳ Model is loading on HuggingFace... try again in {int(estimated_time)}s."
             elif response.status_code == 404:
                 return f"❌ Error 404: Model not found. URL tried: {url}"
             elif response.status_code == 401:
                 return "❌ Error 401: Unauthorized. Please check your Hugging Face API Key."
+            elif response.status_code == 429:
+                return "❌ Error 429: Rate limit exceeded. Please wait a moment and try again."
+            elif response.status_code == 422:
+                # Validation error - often means the model doesn't support certain parameters
+                error_detail = response.json().get("error", response.text[:200])
+                return f"❌ Error 422: Validation error - {error_detail}"
             else:
                 return f"Error {response.status_code}: {response.text[:200]}"
+        except httpx.TimeoutException:
+            return "❌ Request timed out. The model may be under heavy load. Please try again."
+        except httpx.ConnectError:
+            return "❌ Connection error. Please check your internet connection."
         except Exception as e:
             return f"Connection error: {e}"
 
     def stream(self, messages, temperature=0.3):
         # HF Inference API free tier doesn't support easy streaming
+        # Return the full response as a single chunk
         full_response = self.generate(messages, temperature)
         yield full_response
 
@@ -511,6 +531,7 @@ class HuggingFaceLLM:
                 out += f"<|system|>\n{m['content']}</s>\n"
         out += "<|assistant|>\n"
         return out
+
 
 class OpenAILLM:
     def __init__(self, api_key):
@@ -547,7 +568,8 @@ class OpenAILLM:
         except Exception as e:
             yield f"Error: {e}"
 
-class XaiLLM(OpenAILLM):
+
+class XaiLLM:
     def __init__(self, api_key):
         self.api_key = api_key
         self.model = "grok-beta"
@@ -582,6 +604,7 @@ class XaiLLM(OpenAILLM):
                         except: continue
         except Exception as e:
             yield f"Error: {e}"
+
 
 # ============================================================================
 # MAIN APP

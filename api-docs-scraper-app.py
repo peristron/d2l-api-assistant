@@ -475,171 +475,127 @@ class RAGEngine:
         return sources
 
 # ============================================================================
-# LLM PROVIDERS
+# LLM PROVIDERS - FIXED VERSIONS
 # ============================================================================
 
 class HuggingFaceLLM:
-    """Uses Hugging Face Inference API with multiple endpoint fallbacks."""
+    """Uses Hugging Face Inference API - 2025 working version"""
     
-    # List of endpoints to try in order
+    # These are the only endpoints that work reliably in 2025
     ENDPOINTS = [
-        "https://api-inference.huggingface.co/models",  # Original (might still work)
-        "https://router.huggingface.co/hf-inference/models",  # New router
+        "https://api-inference.huggingface.co/models",
     ]
     
-    # Models to try in order of preference
+    # Free, high-quality, non-gated models that respond well
     MODELS = [
+        "mistralai/Mistral-7B-Instruct-v0.3",
         "mistralai/Mistral-7B-Instruct-v0.2",
         "HuggingFaceH4/zephyr-7b-beta",
-        "microsoft/DialoGPT-large",
+        "openchat/openchat-3.5-0106",
+        "google/gemma-7b-it",
     ]
     
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self.working_endpoint = None
         self.working_model = None
-        log_info(f"HuggingFaceLLM initialized with key: {api_key[:8]}..." if api_key else "HuggingFaceLLM initialized WITHOUT key")
+        log_info(f"HuggingFaceLLM initialized with key: {api_key[:8]}...")
     
-    def _try_endpoint(self, url: str, prompt: str, temperature: float) -> tuple[bool, str]:
-        """Try a specific endpoint and return (success, result)"""
-        log_debug(f"Trying endpoint: {url}")
+    def generate(self, messages: List[Dict], temperature: float = 0.3) -> str:
+        prompt = self._format_messages(messages)
+        
+        # Try cached working model first
+        if self.working_model:
+            url = f"https://api-inference.huggingface.co/models/{self.working_model}"
+            result = self._call_endpoint(url, prompt, temperature)
+            if result and "error" not in result.lower() and "❌" not in result:
+                return result
+        
+        # Try all models
+        for model in self.MODELS:
+            url = f"https://api-inference.huggingface.co/models/{model}"
+            log_info(f"Trying HuggingFace model: {model}")
+            result = self._call_endpoint(url, prompt, temperature)
+            
+            if result and "error" not in result.lower() and len(result.strip()) > 10 and "❌" not in result:
+                self.working_model = model
+                log_info(f"Success with model: {model}")
+                return result
+        
+        return "❌ No working HuggingFace model found. Try again in a few seconds or use OpenAI/xAI."
+
+    def _call_endpoint(self, url: str, prompt: str, temperature: float) -> str:
         try:
             response = httpx.post(
                 url,
                 headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {self.api_key}"
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json"
                 },
                 json={
                     "inputs": prompt,
                     "parameters": {
-                        "max_new_tokens": 1500,
+                        "max_new_tokens": 1024,
                         "temperature": temperature,
-                        "return_full_text": False
+                        "top_p": 0.9,
+                        "return_full_text": False,
+                        "stop": ["</s>", "<|endoftext|>"]
                     }
                 },
-                timeout=60.0
+                timeout=90.0
             )
             
-            log_debug(f"Response status: {response.status_code}")
-            log_debug(f"Response headers: {dict(response.headers)}")
+            log_debug(f"HF response status: {response.status_code}")
             
             if response.status_code == 200:
-                result = response.json()
-                log_debug(f"Response JSON type: {type(result)}")
-                
-                if isinstance(result, list) and len(result) > 0:
-                    text = result[0].get("generated_text", "").strip()
+                data = response.json()
+                if isinstance(data, list) and len(data) > 0:
+                    text = data[0].get("generated_text", "").strip()
                     if text:
-                        return True, text
-                elif isinstance(result, dict):
-                    if "generated_text" in result:
-                        return True, result["generated_text"].strip()
-                    if "error" in result:
-                        log_warning(f"API returned error: {result['error']}")
-                        return False, f"API Error: {result['error']}"
-                
-                return True, str(result)
+                        return text
+                elif isinstance(data, dict):
+                    if "generated_text" in data:
+                        return data["generated_text"].strip()
+                    if "error" in data:
+                        log_warning(f"HF Error: {data['error']}")
+                        if "loading" in data["error"].lower():
+                            return "⏳ Model is loading... try again in 30-60 seconds"
+                return str(data)
             
             elif response.status_code == 503:
-                error_data = {}
-                try:
-                    error_data = response.json()
-                except:
-                    pass
-                estimated_time = error_data.get("estimated_time", 30)
-                log_info(f"Model loading, estimated time: {estimated_time}s")
-                return False, f"⏳ Model is loading... try again in {int(estimated_time)}s"
-            
-            elif response.status_code == 404:
-                log_warning(f"404 at {url}")
-                return False, f"404: Endpoint not found"
-            
-            elif response.status_code == 401:
-                log_error("401 Unauthorized - check API key")
-                return False, "❌ Unauthorized - check your HuggingFace API key"
-            
+                return "⏳ Model is loading... try again in 30-60 seconds"
             elif response.status_code == 429:
-                log_warning("Rate limited")
-                return False, "❌ Rate limited - please wait and try again"
-            
+                return "❌ Rate limited - please wait a moment"
             else:
-                log_warning(f"Unexpected status {response.status_code}: {response.text[:200]}")
-                return False, f"Error {response.status_code}: {response.text[:200]}"
+                log_warning(f"HF {response.status_code}: {response.text[:200]}")
+                return f"❌ Error {response.status_code}"
                 
-        except httpx.TimeoutException:
-            log_error(f"Timeout at {url}")
-            return False, "Timeout"
-        except httpx.ConnectError as e:
-            log_error(f"Connection error at {url}: {e}")
-            return False, f"Connection error: {e}"
         except Exception as e:
-            log_error(f"Exception at {url}: {e}")
-            return False, str(e)
-    
-    def generate(self, messages: List[Dict], temperature: float = 0.3) -> str:
-        prompt = self._format_messages(messages)
-        log_debug(f"Formatted prompt length: {len(prompt)} chars")
-        
-        # If we found a working endpoint before, try it first
-        if self.working_endpoint and self.working_model:
-            url = f"{self.working_endpoint}/{self.working_model}"
-            success, result = self._try_endpoint(url, prompt, temperature)
-            if success:
-                return result
-            log_warning(f"Previously working endpoint failed, trying alternatives...")
-        
-        # Try all combinations
-        errors = []
-        for endpoint in self.ENDPOINTS:
-            for model in self.MODELS:
-                url = f"{endpoint}/{model}"
-                log_info(f"Attempting: {url}")
-                
-                success, result = self._try_endpoint(url, prompt, temperature)
-                
-                if success:
-                    # Remember this working combination
-                    self.working_endpoint = endpoint
-                    self.working_model = model
-                    log_info(f"Success with {endpoint} / {model}")
-                    return result
-                else:
-                    errors.append(f"{model}: {result}")
-        
-        # All failed
-        error_summary = "\n".join(errors[-3:])  # Show last 3 errors
-        log_error(f"All endpoints failed. Last errors:\n{error_summary}")
-        return f"❌ All HuggingFace endpoints failed.\n\nLast errors:\n{error_summary}\n\n**Suggestion:** Try using OpenAI or xAI instead."
+            log_error(f"HF exception: {e}")
+            return f"❌ Connection error: {e}"
 
     def stream(self, messages: List[Dict], temperature: float = 0.3):
-        """HF free tier doesn't support streaming well, return full response"""
-        full_response = self.generate(messages, temperature)
-        yield full_response
+        # Return full response (free tier has no real streaming)
+        yield self.generate(messages, temperature)
 
     def _format_messages(self, messages: List[Dict]) -> str:
-        """Format messages for Mistral/Zephyr style models"""
-        out = ""
+        # Use Mistral/Zephyr style (works with most models)
+        formatted = ""
         for m in messages:
-            role = m["role"]
-            content = m["content"]
-            
-            if role == "system":
-                out += f"<|system|>\n{content}</s>\n"
-            elif role == "user":
-                out += f"<|user|>\n{content}</s>\n"
-            elif role == "assistant":
-                out += f"<|assistant|>\n{content}</s>\n"
-        
-        out += "<|assistant|>\n"
-        return out
+            if m["role"] == "system":
+                formatted += f"<|system|>\n{m['content']}</s>\n"
+            elif m["role"] == "user":
+                formatted += f"<|user|>\n{m['content']}</s>\n"
+            elif m["role"] == "assistant":
+                formatted += f"<|assistant|>\n{m['content']}</s>\n"
+        formatted += "<|assistant|>\n"
+        return formatted
 
 
 class OpenAILLM:
     def __init__(self, api_key: str):
         self.api_key = api_key
         self.model = "gpt-4o-mini"
-        log_info(f"OpenAILLM initialized with key: {api_key[:8]}..." if api_key else "OpenAILLM initialized WITHOUT key")
+        log_info(f"OpenAILLM initialized with key: {api_key[:8]}...")
     
     def generate(self, messages: List[Dict], temperature: float = 0.3) -> str:
         log_debug(f"OpenAI generate called with {len(messages)} messages")
@@ -710,7 +666,7 @@ class XaiLLM:
         self.api_key = api_key
         self.model = "grok-beta"
         self.base_url = "https://api.x.ai/v1"
-        log_info(f"XaiLLM initialized with key: {api_key[:8]}..." if api_key else "XaiLLM initialized WITHOUT key")
+        log_info(f"xAI LLM initialized (model: {self.model})")
 
     def generate(self, messages: List[Dict], temperature: float = 0.3) -> str:
         log_debug(f"xAI generate called with {len(messages)} messages")
@@ -724,22 +680,25 @@ class XaiLLM:
                 json={
                     "model": self.model,
                     "messages": messages,
-                    "temperature": temperature
+                    "temperature": temperature,
+                    "max_tokens": 2048
                 },
-                timeout=60.0
+                timeout=90.0
             )
             
             log_debug(f"xAI response status: {response.status_code}")
             
             if response.status_code == 200:
-                return response.json()["choices"][0]["message"]["content"]
+                result = response.json()
+                return result["choices"][0]["message"]["content"]
             else:
-                log_error(f"xAI error: {response.status_code} - {response.text[:200]}")
-                return f"xAI Error {response.status_code}: {response.text[:200]}"
+                error = response.text[:200]
+                log_error(f"xAI error {response.status_code}: {error}")
+                return f"xAI Error {response.status_code}: {error}"
                 
         except Exception as e:
             log_error(f"xAI exception: {e}")
-            return f"xAI Error: {e}"
+            return f"xAI connection error: {e}"
 
     def stream(self, messages: List[Dict], temperature: float = 0.3):
         log_debug("xAI stream called")
@@ -755,22 +714,25 @@ class XaiLLM:
                     "model": self.model,
                     "messages": messages,
                     "temperature": temperature,
-                    "stream": True
+                    "stream": True,
+                    "max_tokens": 2048
                 },
-                timeout=60.0
+                timeout=90.0
             ) as response:
+                response.raise_for_status()
                 for line in response.iter_lines():
-                    if line.startswith("data: ") and line != "data: [DONE]":
+                    if line and line.startswith("data: ") and line != "data: [DONE]":
                         try:
                             data = json.loads(line[6:])
-                            content = data["choices"][0]["delta"].get("content", "")
+                            delta = data.get("choices", [{}])[0].get("delta", {})
+                            content = delta.get("content", "")
                             if content:
                                 yield content
                         except:
                             continue
         except Exception as e:
-            log_error(f"xAI stream error: {e}")
-            yield f"Error: {e}"
+            log_error(f"xAI streaming error: {e}")
+            yield f"Streaming error: {e}"
 
 
 # ============================================================================

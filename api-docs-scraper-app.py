@@ -450,19 +450,16 @@ class HuggingFaceLLM:
     """Uses Hugging Face Inference API. Requires an API Token."""
     def __init__(self, api_key):
         self.api_key = api_key
-        # UPDATED: Switched to Zephyr (more reliable on free tier than Mistral v0.3)
+        # UPDATED: Use Zephyr (reliable & ungated)
         self.model = "HuggingFaceH4/zephyr-7b-beta"
-        # UPDATED: Reverted to standard Inference API URL
-        self.base_url = "https://api-inference.huggingface.co"
+        # UPDATED: Use the Router URL
+        self.base_url = "https://router.huggingface.co/hf"
     
     def generate(self, messages, temperature=0.3):
         prompt = self._format_messages(messages)
         try:
-            # Correctly construct URL: base + /models/ + model_id
-            url = f"{self.base_url}/models/{self.model}"
-            
             response = httpx.post(
-                url,
+                f"{self.base_url}/models/{self.model}",
                 headers={
                     "Content-Type": "application/json",
                     "Authorization": f"Bearer {self.api_key}"
@@ -486,7 +483,9 @@ class HuggingFaceLLM:
             elif response.status_code == 503:
                 return "⏳ Model is loading on HuggingFace... try again in 30s."
             elif response.status_code == 404:
-                return f"❌ Error 404: Model not found. URL tried: {url}"
+                return f"❌ Error 404: Model not found. URL tried: {self.base_url}/models/{self.model}"
+            elif response.status_code == 410:
+                return "❌ Error 410: URL Gone. Hugging Face changed the API endpoint."
             elif response.status_code == 401:
                 return "❌ Error 401: Unauthorized. Please check your Hugging Face API Key."
             else:

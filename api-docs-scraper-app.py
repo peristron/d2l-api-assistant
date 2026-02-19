@@ -450,15 +450,19 @@ class HuggingFaceLLM:
     """Uses Hugging Face Inference API. Requires an API Token."""
     def __init__(self, api_key):
         self.api_key = api_key
-        self.model = "mistralai/Mistral-7B-Instruct-v0.3"
-        # UPDATED: Use the new Router URL
-        self.base_url = "https://router.huggingface.co/hf"
+        # UPDATED: Switched to Zephyr (more reliable on free tier than Mistral v0.3)
+        self.model = "HuggingFaceH4/zephyr-7b-beta"
+        # UPDATED: Reverted to standard Inference API URL
+        self.base_url = "https://api-inference.huggingface.co"
     
     def generate(self, messages, temperature=0.3):
         prompt = self._format_messages(messages)
         try:
+            # Correctly construct URL: base + /models/ + model_id
+            url = f"{self.base_url}/models/{self.model}"
+            
             response = httpx.post(
-                f"{self.base_url}/models/{self.model}",
+                url,
                 headers={
                     "Content-Type": "application/json",
                     "Authorization": f"Bearer {self.api_key}"
@@ -481,6 +485,8 @@ class HuggingFaceLLM:
                 return str(result)
             elif response.status_code == 503:
                 return "⏳ Model is loading on HuggingFace... try again in 30s."
+            elif response.status_code == 404:
+                return f"❌ Error 404: Model not found. URL tried: {url}"
             elif response.status_code == 401:
                 return "❌ Error 401: Unauthorized. Please check your Hugging Face API Key."
             else:
@@ -497,11 +503,12 @@ class HuggingFaceLLM:
         out = ""
         for m in messages:
             if m["role"] == "user":
-                out += f"[INST] {m['content']} [/INST]"
+                out += f"<|user|>\n{m['content']}</s>\n"
             elif m["role"] == "assistant":
-                out += f" {m['content']} </s>"
+                out += f"<|assistant|>\n{m['content']}</s>\n"
             elif m["role"] == "system":
-                out += f"[INST] <<SYS>>\n{m['content']}\n<</SYS>>\n"
+                out += f"<|system|>\n{m['content']}</s>\n"
+        out += "<|assistant|>\n"
         return out
 
 class OpenAILLM:
@@ -617,7 +624,7 @@ def main():
         persona = st.radio("Style:", ["developer", "plain"], format_func=lambda x: "👨‍💻 Developer" if x == "developer" else "📝 Plain English")
         st.divider()
         
-        model_choice = st.selectbox("Model:", ["huggingface", "openai", "xai"], format_func=lambda x: {"huggingface": "Mistral 7B (Hugging Face)", "openai": "GPT-4o (OpenAI)", "xai": "Grok (xAI)"}[x])
+        model_choice = st.selectbox("Model:", ["huggingface", "openai", "xai"], format_func=lambda x: {"huggingface": "Zephyr 7B (Hugging Face)", "openai": "GPT-4o (OpenAI)", "xai": "Grok (xAI)"}[x])
         
         api_key = None
         

@@ -789,28 +789,45 @@ class XaiLLM:
 # ============================================================================
 
 def get_secret(key_name: str) -> Optional[str]:
-    """Safely get a secret from Streamlit secrets or environment"""
-    value = None
+    """
+    Safely get a secret from Streamlit secrets or environment.
+    Handles both flat and nested secret structures.
+    """
     
-    # Method 1: Direct st.secrets access
+    # Method 1: Direct access (flat structure)
     try:
-        if hasattr(st, 'secrets') and key_name in st.secrets:
-            value = st.secrets[key_name]
-            log_debug(f"Found '{key_name}' in st.secrets (direct)")
-            return str(value) if value else None
+        value = st.secrets[key_name]
+        if value is not None:
+            log_debug(f"✅ Found '{key_name}' directly in st.secrets")
+            return str(value)
+    except KeyError:
+        pass
     except Exception as e:
-        log_debug(f"Direct secrets access failed for '{key_name}': {e}")
+        log_debug(f"Direct access to '{key_name}' failed: {e}")
     
-    # Method 2: Environment variable
+    # Method 2: Search in nested sections
     try:
-        value = os.environ.get(key_name)
-        if value:
-            log_debug(f"Found '{key_name}' in environment")
-            return value
+        for section_name in st.secrets:
+            section = st.secrets[section_name]
+            if isinstance(section, dict) or hasattr(section, 'keys'):
+                try:
+                    if key_name in section:
+                        value = section[key_name]
+                        if value is not None:
+                            log_debug(f"✅ Found '{key_name}' in st.secrets['{section_name}']")
+                            return str(value)
+                except:
+                    pass
     except Exception as e:
-        log_debug(f"Environment access failed for '{key_name}': {e}")
+        log_debug(f"Nested search for '{key_name}' failed: {e}")
     
-    log_debug(f"Secret '{key_name}' not found anywhere")
+    # Method 3: Environment variable
+    value = os.environ.get(key_name)
+    if value:
+        log_debug(f"✅ Found '{key_name}' in environment variables")
+        return value
+    
+    log_debug(f"❌ Secret '{key_name}' not found anywhere")
     return None
 
 

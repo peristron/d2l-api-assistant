@@ -42,14 +42,12 @@ from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunct
 # LOGGING SETUP - Enhanced for debugging
 # ============================================================================
 
-# Create a custom logger
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# Store logs in session state for display
 def log_to_session(level: str, message: str):
     """Log message and store in session state for UI display"""
     timestamp = datetime.now().strftime('%H:%M:%S')
@@ -59,10 +57,8 @@ def log_to_session(level: str, message: str):
         st.session_state.debug_logs = []
     
     st.session_state.debug_logs.append(log_entry)
-    # Keep only last 100 logs
     st.session_state.debug_logs = st.session_state.debug_logs[-100:]
     
-    # Also log to standard logger
     getattr(logger, level.lower(), logger.info)(message)
 
 def log_debug(msg): log_to_session("DEBUG", msg)
@@ -475,55 +471,70 @@ class RAGEngine:
         return sources
 
 # ============================================================================
-# LLM PROVIDERS - FIXED VERSIONS
+# LLM PROVIDERS
 # ============================================================================
 
 class HuggingFaceLLM:
-    """Uses Hugging Face Inference API - 2025 working version"""
+    """Uses Hugging Face Inference API - 2025 working version with extended model list"""
     
-    # These are the only endpoints that work reliably in 2025
-    ENDPOINTS = [
-        "https://api-inference.huggingface.co/models",
-    ]
-    
-    # Free, high-quality, non-gated models that respond well
+    # Extended list of models to try - some may be loaded, others may need warm-up
     MODELS = [
         "mistralai/Mistral-7B-Instruct-v0.3",
         "mistralai/Mistral-7B-Instruct-v0.2",
+        "mistralai/Mistral-7B-Instruct-v0.1",
         "HuggingFaceH4/zephyr-7b-beta",
+        "HuggingFaceH4/zephyr-7b-alpha",
+        "microsoft/Phi-3-mini-4k-instruct",
+        "Qwen/Qwen2-7B-Instruct",
+        "meta-llama/Llama-2-7b-chat-hf",
+        "tiiuae/falcon-7b-instruct",
         "openchat/openchat-3.5-0106",
-        "google/gemma-7b-it",
     ]
     
     def __init__(self, api_key: str):
         self.api_key = api_key
         self.working_model = None
-        log_info(f"HuggingFaceLLM initialized with key: {api_key[:8]}...")
+        if api_key:
+            log_info(f"HuggingFaceLLM initialized with key: {api_key[:10]}...")
+        else:
+            log_error("HuggingFaceLLM initialized WITHOUT key!")
     
     def generate(self, messages: List[Dict], temperature: float = 0.3) -> str:
+        if not self.api_key:
+            return "❌ No HuggingFace API key provided"
+            
         prompt = self._format_messages(messages)
+        log_debug(f"Prompt length: {len(prompt)} characters")
         
         # Try cached working model first
         if self.working_model:
-            url = f"https://api-inference.huggingface.co/models/{self.working_model}"
-            result = self._call_endpoint(url, prompt, temperature)
-            if result and "error" not in result.lower() and "❌" not in result:
+            log_info(f"Trying cached model: {self.working_model}")
+            result = self._call_model(self.working_model, prompt, temperature)
+            if result and not result.startswith("❌") and not result.startswith("⏳"):
                 return result
+            log_warning(f"Cached model failed, trying others...")
         
         # Try all models
+        errors = []
         for model in self.MODELS:
-            url = f"https://api-inference.huggingface.co/models/{model}"
-            log_info(f"Trying HuggingFace model: {model}")
-            result = self._call_endpoint(url, prompt, temperature)
+            log_info(f"Trying model: {model}")
+            result = self._call_model(model, prompt, temperature)
             
-            if result and "error" not in result.lower() and len(result.strip()) > 10 and "❌" not in result:
+            if result and not result.startswith("❌") and not result.startswith("⏳") and len(result.strip()) > 20:
                 self.working_model = model
-                log_info(f"Success with model: {model}")
+                log_info(f"✅ Success with model: {model}")
                 return result
+            else:
+                errors.append(f"{model.split('/')[-1]}: {result[:50] if result else 'No response'}")
+                log_warning(f"Model {model} failed: {result[:100] if result else 'No response'}")
         
-        return "❌ No working HuggingFace model found. Try again in a few seconds or use OpenAI/xAI."
+        # All failed
+        error_summary = "\n".join(errors[-5:])
+        return f"❌ All HuggingFace models failed.\n\nErrors:\n{error_summary}\n\n**Suggestion:** Models may be loading. Wait 30-60 seconds and try again, or use OpenAI/xAI."
 
-    def _call_endpoint(self, url: str, prompt: str, temperature: float) -> str:
+    def _call_model(self, model: str, prompt: str, temperature: float) -> str:
+        url = f"https://api-inference.huggingface.co/models/{model}"
+        
         try:
             response = httpx.post(
                 url,
@@ -535,58 +546,81 @@ class HuggingFaceLLM:
                     "inputs": prompt,
                     "parameters": {
                         "max_new_tokens": 1024,
-                        "temperature": temperature,
+                        "temperature": max(temperature, 0.1),
                         "top_p": 0.9,
                         "return_full_text": False,
-                        "stop": ["</s>", "<|endoftext|>"]
+                        "do_sample": True
+                    },
+                    "options": {
+                        "wait_for_model": True,
+                        "use_cache": True
                     }
                 },
-                timeout=90.0
+                timeout=120.0
             )
             
-            log_debug(f"HF response status: {response.status_code}")
+            log_debug(f"Response status: {response.status_code}")
             
             if response.status_code == 200:
                 data = response.json()
+                log_debug(f"Response data type: {type(data)}")
+                
                 if isinstance(data, list) and len(data) > 0:
                     text = data[0].get("generated_text", "").strip()
                     if text:
                         return text
+                    return "❌ Empty response from model"
                 elif isinstance(data, dict):
                     if "generated_text" in data:
                         return data["generated_text"].strip()
                     if "error" in data:
-                        log_warning(f"HF Error: {data['error']}")
-                        if "loading" in data["error"].lower():
-                            return "⏳ Model is loading... try again in 30-60 seconds"
-                return str(data)
+                        error_msg = data["error"]
+                        if "loading" in error_msg.lower():
+                            return "⏳ Model loading..."
+                        return f"❌ {error_msg}"
+                return f"❌ Unexpected response format: {str(data)[:100]}"
             
             elif response.status_code == 503:
-                return "⏳ Model is loading... try again in 30-60 seconds"
+                try:
+                    data = response.json()
+                    if "estimated_time" in data:
+                        return f"⏳ Model loading ({int(data['estimated_time'])}s)..."
+                except:
+                    pass
+                return "⏳ Model loading..."
+            
+            elif response.status_code == 401:
+                return "❌ Invalid API key"
+            
             elif response.status_code == 429:
-                return "❌ Rate limited - please wait a moment"
+                return "❌ Rate limited"
+            
+            elif response.status_code == 404:
+                return "❌ Model not found"
+            
             else:
-                log_warning(f"HF {response.status_code}: {response.text[:200]}")
-                return f"❌ Error {response.status_code}"
+                return f"❌ HTTP {response.status_code}: {response.text[:100]}"
                 
+        except httpx.TimeoutException:
+            return "❌ Request timeout"
         except Exception as e:
-            log_error(f"HF exception: {e}")
-            return f"❌ Connection error: {e}"
+            log_error(f"Exception calling {model}: {e}")
+            return f"❌ Error: {str(e)[:50]}"
 
     def stream(self, messages: List[Dict], temperature: float = 0.3):
-        # Return full response (free tier has no real streaming)
         yield self.generate(messages, temperature)
 
     def _format_messages(self, messages: List[Dict]) -> str:
-        # Use Mistral/Zephyr style (works with most models)
         formatted = ""
         for m in messages:
-            if m["role"] == "system":
-                formatted += f"<|system|>\n{m['content']}</s>\n"
-            elif m["role"] == "user":
-                formatted += f"<|user|>\n{m['content']}</s>\n"
-            elif m["role"] == "assistant":
-                formatted += f"<|assistant|>\n{m['content']}</s>\n"
+            role = m["role"]
+            content = m["content"]
+            if role == "system":
+                formatted += f"<|system|>\n{content}</s>\n"
+            elif role == "user":
+                formatted += f"<|user|>\n{content}</s>\n"
+            elif role == "assistant":
+                formatted += f"<|assistant|>\n{content}</s>\n"
         formatted += "<|assistant|>\n"
         return formatted
 
@@ -595,9 +629,15 @@ class OpenAILLM:
     def __init__(self, api_key: str):
         self.api_key = api_key
         self.model = "gpt-4o-mini"
-        log_info(f"OpenAILLM initialized with key: {api_key[:8]}...")
+        if api_key:
+            log_info(f"OpenAILLM initialized with key: {api_key[:10]}...")
+        else:
+            log_error("OpenAILLM initialized WITHOUT key!")
     
     def generate(self, messages: List[Dict], temperature: float = 0.3) -> str:
+        if not self.api_key:
+            return "❌ No OpenAI API key provided"
+            
         log_debug(f"OpenAI generate called with {len(messages)} messages")
         try:
             response = httpx.post(
@@ -622,11 +662,11 @@ class OpenAILLM:
                 return result["choices"][0]["message"]["content"]
             else:
                 log_error(f"OpenAI error: {response.status_code} - {response.text[:200]}")
-                return f"OpenAI Error {response.status_code}: {response.text[:200]}"
+                return f"❌ OpenAI Error {response.status_code}: {response.text[:200]}"
                 
         except Exception as e:
             log_error(f"OpenAI exception: {e}")
-            return f"OpenAI Error: {e}"
+            return f"❌ OpenAI Error: {e}"
 
     def stream(self, messages: List[Dict], temperature: float = 0.3):
         log_debug("OpenAI stream called")
@@ -658,7 +698,7 @@ class OpenAILLM:
                             continue
         except Exception as e:
             log_error(f"OpenAI stream error: {e}")
-            yield f"Error: {e}"
+            yield f"❌ Error: {e}"
 
 
 class XaiLLM:
@@ -666,9 +706,15 @@ class XaiLLM:
         self.api_key = api_key
         self.model = "grok-beta"
         self.base_url = "https://api.x.ai/v1"
-        log_info(f"xAI LLM initialized (model: {self.model})")
+        if api_key:
+            log_info(f"XaiLLM initialized with key: {api_key[:10]}...")
+        else:
+            log_error("XaiLLM initialized WITHOUT key!")
 
     def generate(self, messages: List[Dict], temperature: float = 0.3) -> str:
+        if not self.api_key:
+            return "❌ No xAI API key provided"
+            
         log_debug(f"xAI generate called with {len(messages)} messages")
         try:
             response = httpx.post(
@@ -694,11 +740,11 @@ class XaiLLM:
             else:
                 error = response.text[:200]
                 log_error(f"xAI error {response.status_code}: {error}")
-                return f"xAI Error {response.status_code}: {error}"
+                return f"❌ xAI Error {response.status_code}: {error}"
                 
         except Exception as e:
             log_error(f"xAI exception: {e}")
-            return f"xAI connection error: {e}"
+            return f"❌ xAI connection error: {e}"
 
     def stream(self, messages: List[Dict], temperature: float = 0.3):
         log_debug("xAI stream called")
@@ -719,7 +765,10 @@ class XaiLLM:
                 },
                 timeout=90.0
             ) as response:
-                response.raise_for_status()
+                if response.status_code != 200:
+                    yield f"❌ xAI Error {response.status_code}"
+                    return
+                    
                 for line in response.iter_lines():
                     if line and line.startswith("data: ") and line != "data: [DONE]":
                         try:
@@ -732,43 +781,37 @@ class XaiLLM:
                             continue
         except Exception as e:
             log_error(f"xAI streaming error: {e}")
-            yield f"Streaming error: {e}"
+            yield f"❌ Streaming error: {e}"
 
 
 # ============================================================================
-# HELPER: Get API Key with logging
+# HELPER: Get API Key with logging - SIMPLIFIED AND FIXED
 # ============================================================================
 
 def get_secret(key_name: str) -> Optional[str]:
-    """Safely get a secret with logging"""
+    """Safely get a secret from Streamlit secrets or environment"""
+    value = None
+    
+    # Method 1: Direct st.secrets access
     try:
-        # Try st.secrets first
-        if hasattr(st, 'secrets'):
-            # Try direct access
-            if key_name in st.secrets:
-                value = st.secrets[key_name]
-                log_debug(f"Found secret '{key_name}' in st.secrets")
-                return value
-            
-            # Try nested access (e.g., secrets.toml with sections)
-            for section in st.secrets:
-                if isinstance(st.secrets[section], dict) and key_name in st.secrets[section]:
-                    value = st.secrets[section][key_name]
-                    log_debug(f"Found secret '{key_name}' in st.secrets[{section}]")
-                    return value
-        
-        # Try environment variable
+        if hasattr(st, 'secrets') and key_name in st.secrets:
+            value = st.secrets[key_name]
+            log_debug(f"Found '{key_name}' in st.secrets (direct)")
+            return str(value) if value else None
+    except Exception as e:
+        log_debug(f"Direct secrets access failed for '{key_name}': {e}")
+    
+    # Method 2: Environment variable
+    try:
         value = os.environ.get(key_name)
         if value:
-            log_debug(f"Found '{key_name}' in environment variables")
+            log_debug(f"Found '{key_name}' in environment")
             return value
-        
-        log_debug(f"Secret '{key_name}' not found")
-        return None
-        
     except Exception as e:
-        log_warning(f"Error getting secret '{key_name}': {e}")
-        return None
+        log_debug(f"Environment access failed for '{key_name}': {e}")
+    
+    log_debug(f"Secret '{key_name}' not found anywhere")
+    return None
 
 
 def list_available_secrets() -> List[str]:
@@ -777,14 +820,38 @@ def list_available_secrets() -> List[str]:
     try:
         if hasattr(st, 'secrets'):
             for key in st.secrets:
-                if isinstance(st.secrets[key], dict):
-                    for subkey in st.secrets[key]:
-                        secrets.append(f"{key}.{subkey}")
-                else:
-                    secrets.append(key)
+                secrets.append(str(key))
     except Exception as e:
         log_warning(f"Error listing secrets: {e}")
     return secrets
+
+
+def debug_secrets():
+    """Debug function to check secrets loading"""
+    info = {
+        "has_st_secrets": hasattr(st, 'secrets'),
+        "secrets_keys": [],
+        "test_values": {}
+    }
+    
+    try:
+        if hasattr(st, 'secrets'):
+            info["secrets_keys"] = list(st.secrets.keys()) if hasattr(st.secrets, 'keys') else []
+            
+            # Test each expected key
+            for key in ["HUGGINGFACE_API_KEY", "OPENAI_API_KEY", "XAI_API_KEY", "MODEL_PASSWORD", "ADMIN_PASSWORD"]:
+                try:
+                    val = st.secrets.get(key, None) if hasattr(st.secrets, 'get') else st.secrets[key] if key in st.secrets else None
+                    if val:
+                        info["test_values"][key] = f"{str(val)[:8]}..." if len(str(val)) > 8 else "***"
+                    else:
+                        info["test_values"][key] = "NOT FOUND"
+                except:
+                    info["test_values"][key] = "ERROR"
+    except Exception as e:
+        info["error"] = str(e)
+    
+    return info
 
 
 # ============================================================================
@@ -849,9 +916,9 @@ def main():
         # Model Selection
         model_choice = st.selectbox(
             "Model:",
-            ["huggingface", "openai", "xai"],
+            ["openai", "xai", "huggingface"],
             format_func=lambda x: {
-                "huggingface": "🤗 HuggingFace (Free)",
+                "huggingface": "🤗 HuggingFace (Free - May be slow)",
                 "openai": "🧠 GPT-4o-mini (OpenAI)",
                 "xai": "🚀 Grok (xAI)"
             }[x]
@@ -859,25 +926,30 @@ def main():
         
         log_debug(f"Selected model: {model_choice}")
         
+        # Initialize variables
         api_key = None
         auth_valid = False
         
+        # Get the MODEL_PASSWORD from secrets for comparison
+        stored_password = get_secret("MODEL_PASSWORD")
+        log_debug(f"Stored password found: {bool(stored_password)}")
+        
         # KEY HANDLING LOGIC - FIXED
         if model_choice == "huggingface":
-            # Try to get from secrets first
-            api_key = get_secret("HUGGINGFACE_API_KEY") or get_secret("HF_API_KEY")
+            # HuggingFace - try secrets first, then ask user
+            api_key = get_secret("HUGGINGFACE_API_KEY")
             
             if api_key:
                 st.success("✅ HuggingFace key loaded from secrets")
                 auth_valid = True
             else:
-                # Ask user for key
                 api_key = st.text_input(
                     "HuggingFace API Key:",
                     type="password",
-                    help="Get a free key at huggingface.co/settings/tokens"
+                    help="Get a free key at huggingface.co/settings/tokens",
+                    key="hf_key_input"
                 )
-                if api_key:
+                if api_key and len(api_key) > 10:
                     st.success("✅ Key provided")
                     auth_valid = True
                 else:
@@ -885,23 +957,37 @@ def main():
                     auth_valid = False
                     
         elif model_choice in ["openai", "xai"]:
-            # Premium models need password
-            pwd = st.text_input("Access Password:", type="password")
-            expected_pwd = get_secret("MODEL_PASSWORD") or "password"
+            # OpenAI and xAI need password authentication
+            pwd = st.text_input(
+                "Access Password:", 
+                type="password",
+                key="model_password_input",
+                help="Enter the password to access premium models"
+            )
             
-            if pwd == expected_pwd:
-                key_name = f"{model_choice.upper()}_API_KEY"
-                api_key = get_secret(key_name)
-                
-                if api_key:
-                    st.success(f"✅ Authenticated - {model_choice.upper()} key loaded")
-                    auth_valid = True
+            if pwd:
+                # Compare passwords
+                if stored_password and pwd.strip() == stored_password.strip():
+                    log_debug("Password matched!")
+                    
+                    # Get the appropriate API key
+                    if model_choice == "openai":
+                        api_key = get_secret("OPENAI_API_KEY")
+                    else:
+                        api_key = get_secret("XAI_API_KEY")
+                    
+                    if api_key:
+                        st.success(f"✅ Authenticated - {model_choice.upper()} ready")
+                        auth_valid = True
+                        log_debug(f"API key loaded for {model_choice}: {api_key[:10]}...")
+                    else:
+                        st.error(f"❌ {model_choice.upper()}_API_KEY not found in secrets")
+                        log_error(f"API key not found for {model_choice}")
+                        auth_valid = False
                 else:
-                    st.error(f"❌ {key_name} not found in secrets")
+                    st.error("❌ Invalid password")
+                    log_debug(f"Password mismatch. Entered: '{pwd[:3]}...' Expected: '{stored_password[:3] if stored_password else 'None'}...'")
                     auth_valid = False
-            elif pwd:
-                st.error("❌ Invalid password")
-                auth_valid = False
             else:
                 st.info("🔒 Enter password for premium models")
                 auth_valid = False
@@ -914,28 +1000,22 @@ def main():
             log_info("Chat cleared")
             st.rerun()
 
-        # Debug Panel
+        # Debug Panel - ENHANCED
         with st.expander("🔧 Debug Panel"):
-            st.write("**Session State Keys:**")
-            st.code(list(st.session_state.keys()))
+            st.write("**Secrets Debug:**")
+            secrets_debug = debug_secrets()
+            st.json(secrets_debug)
             
-            st.write("**Available Secrets:**")
-            secrets_list = list_available_secrets()
-            if secrets_list:
-                st.code(secrets_list)
-            else:
-                st.warning("No secrets found")
-            
-            st.write("**Auth Status:**")
+            st.write("**Current Auth State:**")
             st.write(f"- model_choice: `{model_choice}`")
             st.write(f"- auth_valid: `{auth_valid}`")
             st.write(f"- api_key exists: `{bool(api_key)}`")
             if api_key:
-                st.write(f"- api_key preview: `{api_key[:8]}...`")
+                st.write(f"- api_key preview: `{api_key[:10]}...`")
             
             st.write("**Recent Logs:**")
             if st.session_state.debug_logs:
-                for log_entry in st.session_state.debug_logs[-20:]:
+                for log_entry in st.session_state.debug_logs[-15:]:
                     st.text(log_entry)
             else:
                 st.info("No logs yet")
@@ -947,10 +1027,10 @@ def main():
         # Admin Tools
         with st.expander("🔐 Admin Tools"):
             admin_pw = st.text_input("Admin Password:", type="password", key="admin_pw")
-            expected_admin = get_secret("ADMIN_PASSWORD") or "admin"
+            expected_admin = get_secret("ADMIN_PASSWORD")
             
             if st.button("🔄 Refresh DB"):
-                if admin_pw == expected_admin:
+                if expected_admin and admin_pw == expected_admin:
                     st.session_state.kb_ready = False
                     if "rag" in st.session_state:
                         del st.session_state.rag
@@ -1009,7 +1089,10 @@ def main():
             # Check authentication
             if not auth_valid or not api_key:
                 with st.chat_message("assistant"):
-                    error_msg = f"⚠️ Please configure authentication for **{model_choice}** in the sidebar."
+                    if model_choice == "huggingface":
+                        error_msg = "⚠️ Please enter your HuggingFace API key in the sidebar."
+                    else:
+                        error_msg = f"⚠️ Please enter the correct password to use **{model_choice.upper()}**."
                     st.error(error_msg)
                     st.session_state.messages.append({
                         "role": "assistant",
@@ -1025,6 +1108,8 @@ def main():
                     log_debug(f"Found {len(chunks)} relevant chunks")
                     
                     # Create LLM instance
+                    log_info(f"Creating {model_choice} LLM with key: {api_key[:10]}...")
+                    
                     if model_choice == "openai":
                         llm = OpenAILLM(api_key)
                     elif model_choice == "xai":

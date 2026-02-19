@@ -13,13 +13,10 @@ import os
 # ============================================================================
 # CRITICAL FIX: SQLITE FOR STREAMLIT CLOUD
 # ============================================================================
-# ChromaDB requires a newer version of SQLite than what is installed by default
-# on Streamlit Cloud (Debian). We use pysqlite3-binary to override it.
 try:
     __import__('pysqlite3')
     sys.modules['sqlite3'] = sys.modules.pop('pysqlite3')
 except ImportError:
-    # If running locally without pysqlite3-binary, this passes silently
     pass
 
 import streamlit as st
@@ -54,7 +51,6 @@ SCRAPE_CACHE_FILE = "scrape_metadata.json"
 MAX_PAGES = 300
 CRAWL_DELAY = 0.2
 
-# Regex to capture API routes (e.g., GET /d2l/api/...)
 ROUTE_PATTERN = re.compile(r"(GET|POST|PUT|PATCH|DELETE)\s+(/d2l/api/[\w/{}().~\-]+)", re.IGNORECASE)
 
 DEVELOPER_PROMPT = """You are an expert on the Brightspace/D2L Valence API. 
@@ -91,14 +87,12 @@ class DocCrawler:
         )
 
     def normalize_url(self, url: str) -> str:
-        """Strip anchors and index.html to avoid duplicates."""
         url, _ = urldefrag(url)
         if url.endswith("/index.html"):
             url = url[:-10]
         return url.rstrip("/")
 
     def is_valid(self, url: str) -> bool:
-        """Ensure we stay on the documentation domain and ignore assets."""
         parsed = urlparse(url)
         if parsed.hostname != "docs.valence.desire2learn.com":
             return False
@@ -108,7 +102,6 @@ class DocCrawler:
     def crawl_page(self, url: str):
         try:
             response = self.client.get(url)
-            # Handle 404s gracefully
             if response.status_code != 200:
                 logger.warning(f"Skipping {url} (Status {response.status_code})")
                 return None, []
@@ -117,12 +110,9 @@ class DocCrawler:
                 return None, []
 
             soup = BeautifulSoup(response.text, "html.parser")
-            
-            # Extract title
             title = soup.find("title")
             title = title.get_text(strip=True) if title else "Untitled Page"
             
-            # D2L docs usually have content in 'document' or 'rst-content' classes
             main = (
                 soup.find("div", {"role": "main"}) or
                 soup.find("div", class_="document") or
@@ -134,8 +124,6 @@ class DocCrawler:
                 return None, []
             
             content = main.get_text(separator="\n", strip=True)
-            
-            # Extract simple category from URL path (e.g. /lp/ or /le/)
             path_parts = [p for p in urlparse(url).path.split("/") if p]
             category = path_parts[0] if path_parts else "general"
             if category.endswith(".html"): 
@@ -148,7 +136,6 @@ class DocCrawler:
                 "category": category,
             }
             
-            # Find all links
             links = []
             for a in soup.find_all("a", href=True):
                 href = a["href"]
@@ -171,18 +158,15 @@ class DocCrawler:
         
         while queue and len(self.pages) < max_pages:
             url = queue.pop(0)
-            
             if progress_callback:
                 progress_callback(len(self.pages) + 1, url)
             
             logger.info(f"Crawling [{len(self.pages)+1}]: {url}")
-            
             page_data, links = self.crawl_page(url)
             
-            if page_data and len(page_data["content"]) > 100: # Filter empty pages
+            if page_data and len(page_data["content"]) > 100:
                 self.pages.append(page_data)
             
-            # Add new links to queue
             for link in links:
                 if link not in self.visited:
                     self.visited.add(link)
@@ -201,18 +185,15 @@ class DocCrawler:
 # ============================================================================
 
 def create_chunks(pages, progress_callback=None):
-    """Convert pages into searchable chunks."""
     chunks = []
     seen_ids = set()
     total_pages = len(pages)
     
     def make_unique_id(base_string):
-        """Generate a unique ID, handling collisions."""
         chunk_id = hashlib.md5(base_string.encode()).hexdigest()[:16]
         if chunk_id not in seen_ids:
             seen_ids.add(chunk_id)
             return chunk_id
-        
         counter = 1
         while f"{chunk_id}_{counter}" in seen_ids:
             counter += 1
@@ -229,7 +210,6 @@ def create_chunks(pages, progress_callback=None):
         title = page["title"]
         category = page["category"]
         
-        # 1. Summary Chunk (The top of the page)
         summary = content[:1000]
         chunk_id = make_unique_id(f"{url}|summary")
         chunks.append(Chunk(
@@ -243,7 +223,6 @@ def create_chunks(pages, progress_callback=None):
             }
         ))
         
-        # 2. Extract specific API routes
         seen_routes_on_page = set()
         for match in ROUTE_PATTERN.finditer(content):
             method = match.group(1).upper()
@@ -254,22 +233,14 @@ def create_chunks(pages, progress_callback=None):
                 continue
             seen_routes_on_page.add(route_key)
             
-            # Context window around the route
             start = max(0, match.start() - 300)
             end = min(len(content), match.end() + 1000)
             route_context = content[start:end]
             
-            route_content = (
-                f"# API Route: {method} {path}\n"
-                f"Page: {title}\n"
-                f"Source: {url}\n\n"
-                f"{route_context}"
-            )
-            
             chunk_id = make_unique_id(f"{url}|route|{method}|{path}")
             chunks.append(Chunk(
                 chunk_id=chunk_id,
-                content=route_content,
+                content=f"# API Route: {method} {path}\nPage: {title}\nSource: {url}\n\n{route_context}",
                 metadata={
                     "source_url": url,
                     "title": title,
@@ -280,29 +251,19 @@ def create_chunks(pages, progress_callback=None):
                 }
             ))
         
-        # 3. Standard sliding window chunks
         words = content.split()
         chunk_size = 300
         overlap = 50
-        
         part_num = 0
         for i in range(0, len(words), chunk_size - overlap):
             chunk_words = words[i:i + chunk_size]
             chunk_text = " ".join(chunk_words)
-            
             if len(chunk_text) < 50: continue
-            
-            full_content = (
-                f"# {title}\n"
-                f"Source: {url}\n"
-                f"Part: {part_num + 1}\n\n"
-                f"{chunk_text}"
-            )
             
             chunk_id = make_unique_id(f"{url}|content|{part_num}")
             chunks.append(Chunk(
                 chunk_id=chunk_id,
-                content=full_content,
+                content=f"# {title}\nSource: {url}\nPart: {part_num + 1}\n\n{chunk_text}",
                 metadata={
                     "source_url": url,
                     "title": title,
@@ -312,55 +273,43 @@ def create_chunks(pages, progress_callback=None):
                 }
             ))
             part_num += 1
-    
     return chunks
 
 def build_vector_store(chunks, progress_callback=None):
-    """Build ChromaDB vector store from chunks."""
     chroma_path = Path(CHROMA_DIR)
-    
-    # 1. Clean previous DB
     if chroma_path.exists():
         try:
             shutil.rmtree(chroma_path)
         except Exception as e:
-            logger.warning(f"Could not delete folder immediately: {e}")
+            logger.warning(f"Could not delete folder: {e}")
     
     chroma_path.mkdir(exist_ok=True)
     
-    # 2. Initialize Client
     client = chromadb.PersistentClient(path=CHROMA_DIR)
     embedding_fn = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
-    
-    # 3. Create Collection
     collection = client.create_collection(
         name=COLLECTION_NAME,
         embedding_function=embedding_fn
     )
     
-    # 4. Add documents in batches
     batch_size = 50
     total_batches = (len(chunks) + batch_size - 1) // batch_size
     
     for i in range(0, len(chunks), batch_size):
         batch = chunks[i:i + batch_size]
-        
         if progress_callback:
             progress_callback(i // batch_size + 1, total_batches)
         
         ids = [c.chunk_id for c in batch]
         documents = [c.content for c in batch]
         metadatas = []
-        
         for c in batch:
-            # Chroma metadata must be primitives
             meta = {}
             for k, v in c.metadata.items():
                 meta[k] = str(v) if not isinstance(v, (str, int, float, bool)) else v
             metadatas.append(meta)
         
         collection.add(ids=ids, documents=documents, metadatas=metadatas)
-    
     return collection
 
 # ============================================================================
@@ -368,27 +317,21 @@ def build_vector_store(chunks, progress_callback=None):
 # ============================================================================
 
 def build_knowledge_base(force_rebuild=False):
-    """Build or load the knowledge base."""
     cache_path = Path(SCRAPE_CACHE_FILE)
     chroma_path = Path(CHROMA_DIR)
     
-    # Attempt Load
     if not force_rebuild and chroma_path.exists() and cache_path.exists():
         try:
             logger.info("Loading existing KB...")
             metadata = json.loads(cache_path.read_text())
-            
             client = chromadb.PersistentClient(path=str(chroma_path))
             embedding_fn = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
             collection = client.get_collection(name=COLLECTION_NAME, embedding_function=embedding_fn)
-            
-            count = collection.count()
-            if count > 0:
-                return True, f"Loaded {count} chunks.", metadata
+            if collection.count() > 0:
+                return True, f"Loaded {collection.count()} chunks.", metadata
         except Exception as e:
             logger.warning(f"Load failed ({e}), rebuilding...")
     
-    # Rebuild
     status_placeholder = st.empty()
     progress_bar = st.progress(0)
     log_container = st.expander("📋 Build Logs", expanded=True)
@@ -400,15 +343,10 @@ def build_knowledge_base(force_rebuild=False):
     
     try:
         log("Starting clean build...")
-        
-        # Cleanup
         gc.collect()
-        if chroma_path.exists():
-            shutil.rmtree(chroma_path, ignore_errors=True)
-        if cache_path.exists():
-            cache_path.unlink()
+        if chroma_path.exists(): shutil.rmtree(chroma_path, ignore_errors=True)
+        if cache_path.exists(): cache_path.unlink()
         
-        # Step 1: Crawl
         status_placeholder.info("📥 Step 1/3: Crawling Documentation...")
         crawler = DocCrawler()
         pages = crawler.crawl_all(
@@ -416,29 +354,22 @@ def build_knowledge_base(force_rebuild=False):
             progress_callback=lambda c, u: progress_bar.progress(min(c / MAX_PAGES * 0.33, 0.33))
         )
         crawler.close()
-        log(f"Crawled {len(pages)} pages.")
         
-        if not pages:
-            raise Exception("No pages found. Check connection.")
+        if not pages: raise Exception("No pages found.")
 
-        # Step 2: Chunk
         status_placeholder.info("✂️ Step 2/3: Chunking content...")
         chunks = create_chunks(
             pages,
             progress_callback=lambda c, t: progress_bar.progress(0.33 + (c / t * 0.33))
         )
-        log(f"Created {len(chunks)} chunks.")
 
-        # Step 3: Embed
-        status_placeholder.info("🧠 Step 3/3: Embedding vectors (this takes time)...")
+        status_placeholder.info("🧠 Step 3/3: Embedding vectors...")
         collection = build_vector_store(
             chunks,
             progress_callback=lambda b, t: progress_bar.progress(0.66 + (b / t * 0.34))
         )
         final_count = collection.count()
-        log(f"Stored {final_count} vectors.")
         
-        # Save Metadata
         metadata = {
             "scraped_at": datetime.utcnow().isoformat(),
             "pages_count": len(pages),
@@ -476,7 +407,6 @@ class RAGEngine:
                 n_results=n_results,
                 include=["documents", "metadatas", "distances"]
             )
-            
             chunks = []
             if results["documents"] and results["documents"][0]:
                 for i, doc in enumerate(results["documents"][0]):
@@ -492,21 +422,12 @@ class RAGEngine:
 
     def build_messages(self, query, chunks, persona, history=None):
         system_prompt = DEVELOPER_PROMPT if persona == "developer" else PLAIN_PROMPT
-        
-        context_text = "\n\n".join([
-            f"--- Source {i+1} ---\n{c['content']}" 
-            for i, c in enumerate(chunks)
-        ])
+        context_text = "\n\n".join([f"--- Source {i+1} ---\n{c['content']}" for i, c in enumerate(chunks)])
         
         messages = [{"role": "system", "content": system_prompt}]
-        if history:
-            messages.extend(history[-4:]) # Keep last 4 turns
+        if history: messages.extend(history[-4:])
         
-        user_content = (
-            f"Context:\n{context_text}\n\n"
-            f"Question: {query}\n\n"
-            "Answer using the Context above."
-        )
+        user_content = f"Context:\n{context_text}\n\nQuestion: {query}\n\nAnswer using the Context above."
         messages.append({"role": "user", "content": user_content})
         return messages
 
@@ -526,18 +447,22 @@ class RAGEngine:
 # ============================================================================
 
 class HuggingFaceLLM:
-    """Free LLM via HuggingFace Router."""
-    def __init__(self):
+    """Uses Hugging Face Inference API. Requires an API Token."""
+    def __init__(self, api_key):
+        self.api_key = api_key
         self.model = "mistralai/Mistral-7B-Instruct-v0.3"
-        # UPDATED: Use the Router URL
-        self.base_url = "https://router.huggingface.co/hf"
+        # UPDATED: Use the standard Inference API URL
+        self.base_url = "https://api-inference.huggingface.co/models"
     
     def generate(self, messages, temperature=0.3):
         prompt = self._format_messages(messages)
         try:
             response = httpx.post(
-                f"{self.base_url}/models/{self.model}",
-                headers={"Content-Type": "application/json"},
+                f"{self.base_url}/{self.model}",
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.api_key}"
+                },
                 json={
                     "inputs": prompt,
                     "parameters": {
@@ -556,19 +481,19 @@ class HuggingFaceLLM:
                 return str(result)
             elif response.status_code == 503:
                 return "⏳ Model is loading on HuggingFace... try again in 30s."
+            elif response.status_code == 401:
+                return "❌ Error 401: Unauthorized. Please check your Hugging Face API Key."
             else:
-                return f"Error {response.status_code}: {response.text[:100]}"
+                return f"Error {response.status_code}: {response.text[:200]}"
         except Exception as e:
             return f"Connection error: {e}"
 
     def stream(self, messages, temperature=0.3):
         # HF Inference API free tier doesn't support easy streaming
-        # We simulate it by yielding the full result once
         full_response = self.generate(messages, temperature)
         yield full_response
 
     def _format_messages(self, messages):
-        # Convert Chat format to Mistral instruction format
         out = ""
         for m in messages:
             if m["role"] == "user":
@@ -615,10 +540,9 @@ class OpenAILLM:
             yield f"Error: {e}"
 
 class XaiLLM(OpenAILLM):
-    """Grok (API compatible with OpenAI)"""
     def __init__(self, api_key):
         self.api_key = api_key
-        self.model = "grok-beta" # or grok-3-mini
+        self.model = "grok-beta"
         self.base_url = "https://api.x.ai/v1"
 
     def generate(self, messages, temperature=0.3):
@@ -635,7 +559,6 @@ class XaiLLM(OpenAILLM):
             return f"xAI Error: {e}"
 
     def stream(self, messages, temperature=0.3):
-        # Uses same stream logic as OpenAI, just different URL
         try:
             with httpx.stream(
                 "POST", f"{self.base_url}/chat/completions",
@@ -671,7 +594,6 @@ def main():
         success, msg, metadata = build_knowledge_base(force_rebuild=False)
         st.session_state.kb_ready = success
         st.session_state.kb_metadata = metadata
-        
         if not success:
             if st.button("🔄 Try Rebuilding"):
                 build_knowledge_base(force_rebuild=True)
@@ -687,26 +609,34 @@ def main():
     with st.sidebar:
         st.header("⚙️ Settings")
         
-        # KB Stats
         if st.session_state.kb_metadata:
              pages = st.session_state.kb_metadata.get('pages_count', '?')
              chunks = st.session_state.kb_metadata.get('chunks_count', '?')
-             st.success(f"Loaded: {pages} pages, {chunks} chunks")
+             st.success(f"KB Loaded: {pages} pages / {chunks} chunks")
 
         persona = st.radio("Style:", ["developer", "plain"], format_func=lambda x: "👨‍💻 Developer" if x == "developer" else "📝 Plain English")
         st.divider()
         
-        model_choice = st.selectbox("Model:", ["free", "openai", "xai"], format_func=lambda x: {"free": "Free (Mistral 7B)", "openai": "OpenAI (GPT-4o)", "xai": "xAI (Grok)"}[x])
+        model_choice = st.selectbox("Model:", ["huggingface", "openai", "xai"], format_func=lambda x: {"huggingface": "Mistral 7B (Hugging Face)", "openai": "GPT-4o (OpenAI)", "xai": "Grok (xAI)"}[x])
         
         api_key = None
-        if model_choice != "free":
+        
+        # KEY HANDLING LOGIC
+        if model_choice == "huggingface":
+            # Attempt to load from secrets, otherwise ask user
+            api_key = st.secrets.get("HUGGINGFACE_API_KEY")
+            if not api_key:
+                api_key = st.text_input("Hugging Face API Key (Required for 'Free' tier):", type="password", help="Get a free key at huggingface.co/settings/tokens")
+            if api_key: st.success("Key provided")
+        else:
+            # Paid models
             pwd = st.text_input("Access Password:", type="password")
             if pwd == st.secrets.get("MODEL_PASSWORD", "password"):
                 api_key = st.secrets.get(f"{model_choice.upper()}_API_KEY")
                 if api_key: st.success("Authenticated")
             else:
                 st.warning("Enter password to use premium models")
-                model_choice = "free"
+                model_choice = None # invalid
 
         st.divider()
         if st.button("🗑️ Clear Chat"):
@@ -791,21 +721,23 @@ def main():
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"): st.markdown(prompt)
 
+        # Check for Key
+        if not api_key:
+            st.error(f"Please provide an API Key for {model_choice} in the sidebar.")
+            st.stop()
+
         with st.chat_message("assistant"):
             with st.spinner("Searching docs..."):
-                # Retrieve
                 chunks = st.session_state.rag.retrieve(prompt)
                 sources = st.session_state.rag.get_sources(chunks)
                 
-                # Prepare LLM
-                if model_choice == "openai" and api_key: llm = OpenAILLM(api_key)
-                elif model_choice == "xai" and api_key: llm = XaiLLM(api_key)
-                else: llm = HuggingFaceLLM()
+                if model_choice == "openai": llm = OpenAILLM(api_key)
+                elif model_choice == "xai": llm = XaiLLM(api_key)
+                else: llm = HuggingFaceLLM(api_key)
                 
                 history = [{"role": m["role"], "content": m["content"]} for m in st.session_state.messages[:-1]]
                 messages = st.session_state.rag.build_messages(prompt, chunks, persona, history)
                 
-                # Stream Response
                 response_placeholder = st.empty()
                 full_response = ""
                 

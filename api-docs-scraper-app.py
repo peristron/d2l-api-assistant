@@ -450,16 +450,19 @@ class HuggingFaceLLM:
     """Uses Hugging Face Inference API. Requires an API Token."""
     def __init__(self, api_key):
         self.api_key = api_key
-        # UPDATED: Use Zephyr (reliable & ungated)
+        # UPDATED: Zephyr 7B Beta (Free, high quality, not gated)
         self.model = "HuggingFaceH4/zephyr-7b-beta"
-        # UPDATED: Use the Router URL
-        self.base_url = "https://router.huggingface.co/hf"
+        # UPDATED: Standard Inference API URL (Works for Zephyr)
+        self.base_url = "https://api-inference.huggingface.co/models"
     
     def generate(self, messages, temperature=0.3):
         prompt = self._format_messages(messages)
         try:
+            # Construct standard inference URL
+            url = f"{self.base_url}/{self.model}"
+            
             response = httpx.post(
-                f"{self.base_url}/models/{self.model}",
+                url,
                 headers={
                     "Content-Type": "application/json",
                     "Authorization": f"Bearer {self.api_key}"
@@ -483,9 +486,7 @@ class HuggingFaceLLM:
             elif response.status_code == 503:
                 return "⏳ Model is loading on HuggingFace... try again in 30s."
             elif response.status_code == 404:
-                return f"❌ Error 404: Model not found. URL tried: {self.base_url}/models/{self.model}"
-            elif response.status_code == 410:
-                return "❌ Error 410: URL Gone. Hugging Face changed the API endpoint."
+                return f"❌ Error 404: Model not found. URL tried: {url}"
             elif response.status_code == 401:
                 return "❌ Error 401: Unauthorized. Please check your Hugging Face API Key."
             else:
@@ -499,6 +500,7 @@ class HuggingFaceLLM:
         yield full_response
 
     def _format_messages(self, messages):
+        # Zephyr Chat Template
         out = ""
         for m in messages:
             if m["role"] == "user":

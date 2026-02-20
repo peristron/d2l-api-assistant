@@ -754,8 +754,16 @@ class OpenAILLM:
 class XaiLLM:
     def __init__(self, api_key: str):
         self.api_key = api_key
-        # Try different model names
-        self.models = ["grok-2-latest", "grok-beta", "grok-2-1212"]
+        # Comprehensive list of possible model names (xAI keeps changing these)
+        self.models = [
+            "grok-2-latest",
+            "grok-beta",
+            "grok-2-1212",
+            "grok-2",
+            "grok-1",
+            "grok",
+            "grok-vision-beta"
+        ]
         self.working_model = None
         self.base_url = "https://api.x.ai/v1"
         log_info("XaiLLM initialized")
@@ -770,16 +778,38 @@ class XaiLLM:
             if not result["content"].startswith("❌"):
                 return result
         
-        # Try all models
+        # Try all models and collect detailed errors
+        errors = []
         for model in self.models:
             log_info(f"Trying xAI model: {model}")
             result = self._try_model(model, messages, temperature)
+            
             if not result["content"].startswith("❌"):
                 self.working_model = model
-                log_info(f"xAI working model: {model}")
+                log_info(f"✅ xAI working model: {model}")
                 return result
+            else:
+                errors.append(f"  • {model}: {result['content']}")
         
-        return {"content": "❌ All xAI models failed. Check API key or model availability.", "usage": {"input": 0, "output": 0}}
+        # All failed - return detailed error
+        error_details = "\n".join(errors[:5])  # Show first 5 errors
+        return {
+            "content": f"""❌ All xAI models failed. 
+
+**Errors:**
+{error_details}
+
+**Troubleshooting:**
+1. Check your API key at https://console.x.ai/
+2. Verify your xAI account has API access enabled
+3. Check if you have available credits
+4. xAI may have changed model names again
+
+**Current key preview:** {self.api_key[:15]}...
+
+Try DeepSeek or OpenAI while this is resolved.""",
+            "usage": {"input": 0, "output": 0}
+        }
     
     def _try_model(self, model: str, messages: List[Dict], temperature: float) -> Dict[str, Any]:
         try:
@@ -798,6 +828,8 @@ class XaiLLM:
                 timeout=90.0
             )
             
+            log_debug(f"xAI {model} response: {response.status_code}")
+            
             if response.status_code == 200:
                 result = response.json()
                 content = result["choices"][0]["message"]["content"]
@@ -810,29 +842,58 @@ class XaiLLM:
                         "output": usage.get("completion_tokens", 0)
                     }
                 }
-            else:
+            elif response.status_code == 401:
                 return {
-                    "content": f"❌ xAI {model} Error {response.status_code}",
+                    "content": f"❌ 401 Unauthorized (invalid API key)",
+                    "usage": {"input": 0, "output": 0}
+                }
+            elif response.status_code == 404:
+                return {
+                    "content": f"❌ 404 Model not found",
+                    "usage": {"input": 0, "output": 0}
+                }
+            elif response.status_code == 429:
+                return {
+                    "content": f"❌ 429 Rate limited",
+                    "usage": {"input": 0, "output": 0}
+                }
+            elif response.status_code == 403:
+                return {
+                    "content": f"❌ 403 Forbidden (check account access)",
+                    "usage": {"input": 0, "output": 0}
+                }
+            else:
+                error_text = response.text[:150]
+                return {
+                    "content": f"❌ HTTP {response.status_code}: {error_text}",
                     "usage": {"input": 0, "output": 0}
                 }
                 
+        except httpx.TimeoutException:
+            return {
+                "content": f"❌ Timeout after 90s",
+                "usage": {"input": 0, "output": 0}
+            }
+        except httpx.ConnectError as e:
+            return {
+                "content": f"❌ Connection error: {str(e)[:50]}",
+                "usage": {"input": 0, "output": 0}
+            }
         except Exception as e:
             return {
-                "content": f"❌ {model} error: {str(e)[:50]}",
+                "content": f"❌ Error: {str(e)[:100]}",
                 "usage": {"input": 0, "output": 0}
             }
 
     def stream(self, messages: List[Dict], temperature: float = 0.3):
-        # Find working model first
-        model_to_use = self.working_model if self.working_model else self.models[0]
+        # Find working model first using generate
+        test_result = self.generate([{"role": "user", "content": "Hi"}], temperature)
         
-        # If no working model, try to find one
-        if not self.working_model:
-            test_result = self.generate(messages, temperature)
-            if test_result["content"].startswith("❌"):
-                yield {"chunk": test_result["content"], "done": True, "usage": {"input": 0, "output": 0}}
-                return
-            model_to_use = self.working_model
+        if test_result["content"].startswith("❌"):
+            yield {"chunk": test_result["content"], "done": True, "usage": {"input": 0, "output": 0}}
+            return
+        
+        model_to_use = self.working_model
         
         try:
             total_content = ""
@@ -854,22 +915,47 @@ class XaiLLM:
                 timeout=90.0
             ) as response:
                 if response.status_code != 200:
-                    yield {"chunk": f"❌ xAI Error {response.status_code}", "done": True, "usage": {"input": 0, "output": 0}}
+                    error_text = f"❌ xAI Error {response.status_code}"
+                    try:
+                        error_detail = response.json()
+                        if "error" in error_detail:
+                            error_text += f": {error_detail['error']}"
+                    except:
+                        pass
+                    yield {"chunk": error_text, "done": True, "usage": {"input": 0, "output": 0}}
                     return
                     
                 for line in response.iter_lines():
-                    if line and line.startswith("data: ") and line != "data: [DONE]":
+                    if line and line.startswith("data: "):
+                        if line == "data: [DONE]":
+                            break
                         try:
                             data = json.loads(line[6:])
+                            
+                            # Check for usage (sent at end by some APIs)
+                            if "usage" in data:
+                                usage = data["usage"]
+                                yield {
+                                    "chunk": "",
+                                    "done": True,
+                                    "usage": {
+                                        "input": usage.get("prompt_tokens", 0),
+                                        "output": usage.get("completion_tokens", 0)
+                                    }
+                                }
+                                return
+                            
+                            # Get content
                             delta = data.get("choices", [{}])[0].get("delta", {})
                             content = delta.get("content", "")
                             if content:
                                 total_content += content
                                 yield {"chunk": content, "done": False, "usage": None}
-                        except:
+                        except Exception as e:
+                            log_debug(f"Stream parse error: {e}")
                             continue
                 
-                # Estimate usage
+                # Estimate usage if not provided
                 yield {
                     "chunk": "",
                     "done": True,

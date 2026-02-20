@@ -969,6 +969,81 @@ Try DeepSeek or OpenAI while this is resolved.""",
             yield {"chunk": f"❌ Streaming error: {e}", "done": True, "usage": {"input": 0, "output": 0}}
 
 
+# Add this TEMPORARILY to your code, right before the main() function
+
+def test_xai_models():
+    """Diagnostic function to find working xAI model names"""
+    import streamlit as st
+    
+    xai_key = get_secret("XAI_API_KEY")
+    if not xai_key:
+        st.error("No xAI key found")
+        return
+    
+    st.write("### 🔍 Testing xAI Models")
+    
+    # Test if we can list models
+    try:
+        response = httpx.get(
+            "https://api.x.ai/v1/models",
+            headers={"Authorization": f"Bearer {xai_key}"},
+            timeout=30.0
+        )
+        
+        if response.status_code == 200:
+            models = response.json()
+            st.success("✅ Found available models:")
+            st.json(models)
+        else:
+            st.error(f"❌ Failed to list models: {response.status_code}")
+            st.code(response.text)
+    except Exception as e:
+        st.error(f"Error: {e}")
+    
+    # Try some common model names
+    test_models = [
+        "grok-2-latest",
+        "grok-beta", 
+        "grok-2-1212",
+        "grok-2",
+        "grok-1",
+        "grok",
+        "grok-vision-beta",
+        # New possible names based on recent xAI updates
+        "grok-2-public",
+        "grok-turbo",
+        "grok-3",
+        "grok-preview",
+    ]
+    
+    st.write("### Testing individual models:")
+    
+    for model in test_models:
+        try:
+            response = httpx.post(
+                "https://api.x.ai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {xai_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": model,
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "max_tokens": 5
+                },
+                timeout=30.0
+            )
+            
+            if response.status_code == 200:
+                st.success(f"✅ **{model}** - WORKS!")
+            else:
+                error = response.json() if response.text else {}
+                st.error(f"❌ {model}: {response.status_code} - {error.get('error', 'Unknown error')}")
+                
+        except Exception as e:
+            st.error(f"❌ {model}: {e}")
+
+
 # ============================================================================
 # MAIN APP
 # ============================================================================

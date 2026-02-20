@@ -99,7 +99,7 @@ PRICING = {
         "output": 0.600,  # $0.600 per 1M output tokens
     },
     "xai": {
-        "input": 5.00,    # $5 per 1M input tokens (grok-beta)
+        "input": 5.00,    # $5 per 1M input tokens (grok-3)
         "output": 15.00,  # $15 per 1M output tokens
     },
     "deepseek": {
@@ -148,6 +148,37 @@ def get_secret(key_name: str) -> Optional[str]:
     except KeyError:
         return None
     except Exception:
+        return None
+
+# ============================================================================
+# COVERAGE TRACKING
+# ============================================================================
+
+def check_scraping_quality():
+    """Compare current scrape against validator baseline"""
+    
+    baseline_file = Path("expected_coverage.json")
+    metadata_file = Path(SCRAPE_CACHE_FILE)
+    
+    if not baseline_file.exists() or not metadata_file.exists():
+        return None
+    
+    try:
+        baseline = json.loads(baseline_file.read_text())
+        metadata = json.loads(metadata_file.read_text())
+        
+        expected = baseline.get("expected_minimum_pages", 0)
+        actual = metadata.get("pages_count", 0)
+        
+        return {
+            "coverage": (actual / expected * 100) if expected > 0 else 0,
+            "expected": expected,
+            "actual": actual,
+            "baseline_date": baseline.get("validation_timestamp", "Unknown"),
+            "baseline_routes": baseline.get("expected_minimum_routes", 0)
+        }
+    except Exception as e:
+        log_warning(f"Error checking quality: {e}")
         return None
 
 # ============================================================================
@@ -269,7 +300,7 @@ class DocCrawler:
         self.client.close()
 
 # ============================================================================
-# CHUNKING & EMBEDDING (keeping existing implementation)
+# CHUNKING & EMBEDDING
 # ============================================================================
 
 def create_chunks(pages, progress_callback=None):
@@ -621,7 +652,6 @@ class DeepSeekLLM:
                         try:
                             data = json.loads(line[6:])
                             
-                            # Check for usage info (sent at end)
                             if "usage" in data:
                                 usage = data["usage"]
                                 yield {
@@ -634,7 +664,6 @@ class DeepSeekLLM:
                                 }
                                 return
                             
-                            # Get content chunk
                             delta = data.get("choices", [{}])[0].get("delta", {})
                             content = delta.get("content", "")
                             if content:
@@ -643,7 +672,6 @@ class DeepSeekLLM:
                         except:
                             continue
                 
-                # Fallback if no usage data received - estimate
                 yield {
                     "chunk": "",
                     "done": True,
@@ -738,7 +766,6 @@ class OpenAILLM:
                         except:
                             continue
                 
-                # Estimate usage (OpenAI doesn't send usage in streaming)
                 yield {
                     "chunk": "",
                     "done": True,
@@ -754,9 +781,8 @@ class OpenAILLM:
 class XaiLLM:
     def __init__(self, api_key: str):
         self.api_key = api_key
-        # Updated with working model name from your other app
         self.models = [
-            "grok-3",           # ✅ This is the one that works!
+            "grok-3",
             "grok-2-latest",
             "grok-beta",
         ]
@@ -768,13 +794,11 @@ class XaiLLM:
         if not self.api_key:
             return {"content": "❌ No xAI API key provided", "usage": {"input": 0, "output": 0}}
         
-        # Try working model first
         if self.working_model:
             result = self._try_model(self.working_model, messages, temperature)
             if not result["content"].startswith("❌"):
                 return result
         
-        # Try all models
         errors = []
         for model in self.models:
             log_info(f"Trying xAI model: {model}")
@@ -787,7 +811,6 @@ class XaiLLM:
             else:
                 errors.append(f"  • {model}: {result['content']}")
         
-        # All failed
         error_details = "\n".join(errors[:3])
         return {
             "content": f"❌ All xAI models failed.\n\n{error_details}",
@@ -810,8 +833,6 @@ class XaiLLM:
                 },
                 timeout=90.0
             )
-            
-            log_debug(f"xAI {model} response: {response.status_code}")
             
             if response.status_code == 200:
                 result = response.json()
@@ -839,7 +860,6 @@ class XaiLLM:
             }
 
     def stream(self, messages: List[Dict], temperature: float = 0.3):
-        # Find working model first
         if not self.working_model:
             test_result = self.generate([{"role": "user", "content": "Hi"}], temperature)
             if test_result["content"].startswith("❌"):
@@ -885,7 +905,6 @@ class XaiLLM:
                         except:
                             continue
                 
-                # Estimate usage
                 yield {
                     "chunk": "",
                     "done": True,
@@ -897,81 +916,6 @@ class XaiLLM:
                 
         except Exception as e:
             yield {"chunk": f"❌ Streaming error: {e}", "done": True, "usage": {"input": 0, "output": 0}}
-
-
-# Add this TEMPORARILY to your code, right before the main() function
-
-def test_xai_models():
-    """Diagnostic function to find working xAI model names"""
-    import streamlit as st
-    
-    xai_key = get_secret("XAI_API_KEY")
-    if not xai_key:
-        st.error("No xAI key found")
-        return
-    
-    st.write("### 🔍 Testing xAI Models")
-    
-    # Test if we can list models
-    try:
-        response = httpx.get(
-            "https://api.x.ai/v1/models",
-            headers={"Authorization": f"Bearer {xai_key}"},
-            timeout=30.0
-        )
-        
-        if response.status_code == 200:
-            models = response.json()
-            st.success("✅ Found available models:")
-            st.json(models)
-        else:
-            st.error(f"❌ Failed to list models: {response.status_code}")
-            st.code(response.text)
-    except Exception as e:
-        st.error(f"Error: {e}")
-    
-    # Try some common model names
-    test_models = [
-        "grok-2-latest",
-        "grok-beta", 
-        "grok-2-1212",
-        "grok-2",
-        "grok-1",
-        "grok",
-        "grok-vision-beta",
-        # New possible names based on recent xAI updates
-        "grok-2-public",
-        "grok-turbo",
-        "grok-3",
-        "grok-preview",
-    ]
-    
-    st.write("### Testing individual models:")
-    
-    for model in test_models:
-        try:
-            response = httpx.post(
-                "https://api.x.ai/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {xai_key}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": model,
-                    "messages": [{"role": "user", "content": "Hi"}],
-                    "max_tokens": 5
-                },
-                timeout=30.0
-            )
-            
-            if response.status_code == 200:
-                st.success(f"✅ **{model}** - WORKS!")
-            else:
-                error = response.json() if response.text else {}
-                st.error(f"❌ {model}: {response.status_code} - {error.get('error', 'Unknown error')}")
-                
-        except Exception as e:
-            st.error(f"❌ {model}: {e}")
 
 
 # ============================================================================
@@ -1030,10 +974,44 @@ def main():
     with st.sidebar:
         st.header("⚙️ Settings")
         
+        # KB Status + Coverage Check
         if st.session_state.kb_metadata:
             pages = st.session_state.kb_metadata.get('pages_count', '?')
             chunks = st.session_state.kb_metadata.get('chunks_count', '?')
             st.success(f"KB: {pages} pages / {chunks} chunks")
+            
+            # Coverage tracking
+            st.divider()
+            st.subheader("📊 Scraping Coverage")
+            
+            quality = check_scraping_quality()
+            
+            if quality:
+                coverage = quality["coverage"]
+                
+                if coverage >= 95:
+                    st.success(f"✅ {coverage:.1f}%")
+                elif coverage >= 80:
+                    st.warning(f"⚠️ {coverage:.1f}%")
+                else:
+                    st.error(f"❌ {coverage:.1f}%")
+                
+                with st.expander("Details"):
+                    st.write(f"**Expected Pages:** {quality['expected']}")
+                    st.write(f"**Actual Pages:** {quality['actual']}")
+                    st.write(f"**Expected Routes:** {quality['baseline_routes']}")
+                    st.caption(f"Baseline: {quality['baseline_date'][:10]}")
+            else:
+                with st.expander("No baseline yet"):
+                    st.info("""
+                    **To track coverage:**
+                    1. Run the [Validator App](https://docsscraper-tester-validator.streamlit.app/)
+                    2. Click "Start Full Audit"
+                    3. Go to "Export" tab
+                    4. Click "Save All Reports"
+                    5. Download `expected_coverage.json`
+                    6. Upload to this app's GitHub repo
+                    """)
 
         persona = st.radio(
             "Response Style:",
@@ -1080,7 +1058,6 @@ def main():
                     st.warning("⚠️ No DeepSeek key found")
                     
         else:
-            # OpenAI and xAI need password
             pwd = st.text_input("Access Password:", type="password")
             
             if pwd and model_password and pwd == model_password:

@@ -89,11 +89,11 @@ Use simple language, avoid jargon, and explain things step-by-step.
 Format responses in Markdown."""
 
 # ============================================================================
-# SECRETS ACCESS - SIMPLIFIED AND WORKING
+# SECRETS ACCESS
 # ============================================================================
 
 def get_secret(key_name: str) -> Optional[str]:
-    """Get a secret from Streamlit secrets - SIMPLE VERSION THAT WORKS"""
+    """Get a secret from Streamlit secrets"""
     try:
         value = st.secrets[key_name]
         return str(value) if value else None
@@ -494,49 +494,71 @@ class RAGEngine:
 # ============================================================================
 
 class HuggingFaceLLM:
-    """Uses Hugging Face Inference API"""
-    
-    MODELS = [
-        "mistralai/Mistral-7B-Instruct-v0.3",
-        "mistralai/Mistral-7B-Instruct-v0.2",
-        "HuggingFaceH4/zephyr-7b-beta",
-        "microsoft/Phi-3-mini-4k-instruct",
-        "Qwen/Qwen2-7B-Instruct",
-    ]
+    """
+    Uses HuggingFace Inference API.
+    Note: Free tier models can be slow or unavailable.
+    Uses the Inference API with serverless endpoints.
+    """
     
     def __init__(self, api_key: str):
         self.api_key = api_key
+        self.base_url = "https://api-inference.huggingface.co/models"
+        # These models are most likely to be available on free tier
+        self.models = [
+            "google/flan-t5-xxl",
+            "bigscience/bloom-560m",
+            "gpt2",
+            "facebook/opt-1.3b",
+        ]
         self.working_model = None
-        log_info(f"HuggingFaceLLM initialized")
+        log_info("HuggingFaceLLM initialized")
     
     def generate(self, messages: List[Dict], temperature: float = 0.3) -> str:
         if not self.api_key:
             return "❌ No HuggingFace API key provided"
-            
-        prompt = self._format_messages(messages)
         
-        # Try cached working model first
+        # Convert messages to a simple prompt
+        prompt = self._messages_to_prompt(messages)
+        
+        # Try working model first
         if self.working_model:
-            result = self._call_model(self.working_model, prompt, temperature)
-            if result and not result.startswith("❌") and not result.startswith("⏳"):
+            result = self._try_model(self.working_model, prompt, temperature)
+            if result and not result.startswith("❌"):
                 return result
         
-        # Try all models
-        for model in self.MODELS:
-            log_info(f"Trying model: {model}")
-            result = self._call_model(model, prompt, temperature)
+        # Try each model
+        errors = []
+        for model in self.models:
+            log_info(f"Trying HF model: {model}")
+            result = self._try_model(model, prompt, temperature)
             
-            if result and not result.startswith("❌") and not result.startswith("⏳") and len(result.strip()) > 20:
+            if result and not result.startswith("❌") and len(result) > 10:
                 self.working_model = model
-                log_info(f"✅ Success with model: {model}")
+                log_info(f"✅ HF model working: {model}")
                 return result
+            else:
+                errors.append(f"{model}: {result[:50] if result else 'No response'}")
         
-        return "❌ All HuggingFace models are currently unavailable. Please try OpenAI or xAI."
+        # All failed - provide helpful message
+        return f"""❌ HuggingFace models unavailable.
 
-    def _call_model(self, model: str, prompt: str, temperature: float) -> str:
-        url = f"https://api-inference.huggingface.co/models/{model}"
+**This is normal** - HuggingFace free tier models are often:
+- Loading (cold start takes 20-60 seconds)
+- Rate limited
+- Under heavy load
+
+**Solutions:**
+1. **Wait 30-60 seconds** and try again
+2. **Use OpenAI or xAI** (more reliable)
+3. **Try later** when servers are less busy
+
+Last errors: {'; '.join(errors[:2])}"""
+
+    def _try_model(self, model: str, prompt: str, temperature: float) -> str:
+        url = f"{self.base_url}/{model}"
         
         try:
+            # Simple text generation request
             response = httpx.post(
                 url,
                 headers={
@@ -546,65 +568,74 @@ class HuggingFaceLLM:
                 json={
                     "inputs": prompt,
                     "parameters": {
-                        "max_new_tokens": 1024,
-                        "temperature": max(temperature, 0.1),
-                        "top_p": 0.9,
-                        "return_full_text": False,
-                        "do_sample": True
+                        "max_new_tokens": 500,
+                        "temperature": temperature,
+                        "do_sample": True,
+                        "return_full_text": False
                     },
                     "options": {
-                        "wait_for_model": True,
-                        "use_cache": True
+                        "wait_for_model": True
                     }
                 },
-                timeout=120.0
+                timeout=60.0
             )
+            
+            log_debug(f"HF {model} status: {response.status_code}")
             
             if response.status_code == 200:
                 data = response.json()
+                
+                # Handle different response formats
                 if isinstance(data, list) and len(data) > 0:
-                    text = data[0].get("generated_text", "").strip()
+                    if isinstance(data[0], dict):
+                        text = data[0].get("generated_text", "")
+                    else:
+                        text = str(data[0])
                     if text:
-                        return text
+                        return text.strip()
                 elif isinstance(data, dict):
                     if "generated_text" in data:
                         return data["generated_text"].strip()
                     if "error" in data:
-                        if "loading" in data["error"].lower():
-                            return "⏳ Model loading..."
                         return f"❌ {data['error']}"
+                
                 return "❌ Empty response"
             
             elif response.status_code == 503:
-                return "⏳ Model loading..."
-            elif response.status_code == 401:
-                return "❌ Invalid API key"
+                return "❌ Model loading (503)"
             elif response.status_code == 429:
-                return "❌ Rate limited"
+                return "❌ Rate limited (429)"
+            elif response.status_code == 401:
+                return "❌ Invalid API key (401)"
             else:
                 return f"❌ HTTP {response.status_code}"
                 
         except httpx.TimeoutException:
-            return "❌ Request timeout"
+            return "❌ Timeout"
         except Exception as e:
-            return f"❌ Error: {str(e)[:50]}"
+            return f"❌ {str(e)[:30]}"
+
+    def _messages_to_prompt(self, messages: List[Dict]) -> str:
+        """Convert chat messages to a simple prompt for non-chat models"""
+        parts = []
+        
+        for msg in messages:
+            role = msg["role"]
+            content = msg["content"]
+            
+            if role == "system":
+                parts.append(f"Instructions: {content}\n")
+            elif role == "user":
+                parts.append(f"Question: {content}\n")
+            elif role == "assistant":
+                parts.append(f"Answer: {content}\n")
+        
+        parts.append("Answer:")
+        return "\n".join(parts)
 
     def stream(self, messages: List[Dict], temperature: float = 0.3):
+        # HuggingFace free tier doesn't support streaming well
         yield self.generate(messages, temperature)
-
-    def _format_messages(self, messages: List[Dict]) -> str:
-        formatted = ""
-        for m in messages:
-            role = m["role"]
-            content = m["content"]
-            if role == "system":
-                formatted += f"<|system|>\n{content}</s>\n"
-            elif role == "user":
-                formatted += f"<|user|>\n{content}</s>\n"
-            elif role == "assistant":
-                formatted += f"<|assistant|>\n{content}</s>\n"
-        formatted += "<|assistant|>\n"
-        return formatted
 
 
 class OpenAILLM:
@@ -764,6 +795,8 @@ def main():
         st.session_state.kb_metadata = {}
     if "last_query" not in st.session_state:
         st.session_state.last_query = ""
+    if "current_model" not in st.session_state:
+        st.session_state.current_model = None
 
     # Load secrets ONCE at startup
     hf_key = get_secret("HUGGINGFACE_API_KEY")
@@ -806,29 +839,36 @@ def main():
         
         st.divider()
         
-        # Model Selection
+        # Model Selection with auto-clear on change
         model_choice = st.selectbox(
             "Model:",
             ["openai", "xai", "huggingface"],
             format_func=lambda x: {
-                "huggingface": "🤗 HuggingFace (Free)",
-                "openai": "🧠 GPT-4o-mini (OpenAI)",
+                "huggingface": "🤗 HuggingFace (Free - Unreliable)",
+                "openai": "🧠 GPT-4o-mini (OpenAI) ⭐",
                 "xai": "🚀 Grok (xAI)"
             }[x]
         )
+        
+        # Auto-clear chat when model changes
+        if st.session_state.current_model is not None and st.session_state.current_model != model_choice:
+            st.session_state.messages = []
+            st.session_state.last_query = ""
+            log_info(f"Model changed from {st.session_state.current_model} to {model_choice}, chat cleared")
+        
+        st.session_state.current_model = model_choice
         
         # Authentication handling
         api_key = None
         auth_valid = False
         
         if model_choice == "huggingface":
-            # HuggingFace uses key from secrets directly
             if hf_key:
                 st.success("✅ HuggingFace key loaded")
+                st.caption("⚠️ Note: HF free tier is often slow/unavailable")
                 api_key = hf_key
                 auth_valid = True
             else:
-                # Allow manual entry as fallback
                 manual_key = st.text_input("HuggingFace API Key:", type="password")
                 if manual_key:
                     api_key = manual_key
@@ -850,7 +890,7 @@ def main():
                     api_key = xai_key
                     auth_valid = True
                 else:
-                    st.error(f"❌ {model_choice.upper()} API key not found in secrets")
+                    st.error(f"❌ {model_choice.upper()} API key not found")
             elif pwd:
                 st.error("❌ Invalid password")
             else:
@@ -858,22 +898,30 @@ def main():
 
         st.divider()
         
-        if st.button("🗑️ Clear Chat"):
-            st.session_state.messages = []
-            st.session_state.last_query = ""
-            st.rerun()
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("🗑️ Clear Chat"):
+                st.session_state.messages = []
+                st.session_state.last_query = ""
+                st.rerun()
+        with col2:
+            if st.button("🔄 New Topic"):
+                st.session_state.messages = []
+                st.session_state.last_query = ""
+                st.rerun()
 
         # Debug Panel
         with st.expander("🔧 Debug"):
-            st.write(f"**HF Key:** {'✅' if hf_key else '❌'}")
-            st.write(f"**OpenAI Key:** {'✅' if openai_key else '❌'}")
-            st.write(f"**xAI Key:** {'✅' if xai_key else '❌'}")
-            st.write(f"**Model PW:** {'✅' if model_password else '❌'}")
-            st.write(f"**Admin PW:** {'✅' if admin_password else '❌'}")
+            st.write(f"**Secrets loaded:**")
+            st.write(f"- HF: {'✅' if hf_key else '❌'}")
+            st.write(f"- OpenAI: {'✅' if openai_key else '❌'}")
+            st.write(f"- xAI: {'✅' if xai_key else '❌'}")
+            st.write(f"- Passwords: {'✅' if model_password else '❌'}")
             st.divider()
-            st.write(f"**Selected:** {model_choice}")
-            st.write(f"**Auth Valid:** {auth_valid}")
-            st.write(f"**API Key Set:** {bool(api_key)}")
+            st.write(f"**Current state:**")
+            st.write(f"- Model: {model_choice}")
+            st.write(f"- Auth: {'✅' if auth_valid else '❌'}")
+            st.write(f"- Messages: {len(st.session_state.messages)}")
 
         # Admin Tools
         with st.expander("🔐 Admin"):
@@ -899,7 +947,7 @@ def main():
                         st.markdown(f"- [{s['title']}]({s['url']})")
 
     # Chat Input
-    if prompt := st.chat_input("How do I get a user's enrolled courses?"):
+    if prompt := st.chat_input("Ask about D2L Brightspace API..."):
         if prompt == st.session_state.last_query:
             pass  # Skip duplicate
         else:
@@ -925,7 +973,7 @@ def main():
                 st.stop()
 
             with st.chat_message("assistant"):
-                with st.spinner("🔍 Searching..."):
+                with st.spinner("🔍 Searching documentation..."):
                     chunks = st.session_state.rag.retrieve(prompt)
                     sources = st.session_state.rag.get_sources(chunks)
                     

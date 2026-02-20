@@ -89,6 +89,54 @@ Use simple language, avoid jargon, and explain things step-by-step.
 Format responses in Markdown."""
 
 # ============================================================================
+# COST TRACKING
+# ============================================================================
+
+# Pricing per 1M tokens (as of Jan 2025)
+PRICING = {
+    "openai": {
+        "input": 0.150,   # $0.150 per 1M input tokens
+        "output": 0.600,  # $0.600 per 1M output tokens
+    },
+    "xai": {
+        "input": 5.00,    # $5 per 1M input tokens (grok-beta)
+        "output": 15.00,  # $15 per 1M output tokens
+    },
+    "deepseek": {
+        "input": 0.14,    # $0.14 per 1M input tokens (cache miss)
+        "output": 0.28,   # $0.28 per 1M output tokens
+    }
+}
+
+def estimate_tokens(text: str) -> int:
+    """Rough token estimation (GPT-style: ~4 chars per token)"""
+    return len(text) // 4
+
+def calculate_cost(model: str, input_tokens: int, output_tokens: int) -> float:
+    """Calculate cost in dollars"""
+    if model not in PRICING:
+        return 0.0
+    
+    pricing = PRICING[model]
+    input_cost = (input_tokens / 1_000_000) * pricing["input"]
+    output_cost = (output_tokens / 1_000_000) * pricing["output"]
+    return input_cost + output_cost
+
+def track_usage(model: str, input_tokens: int, output_tokens: int):
+    """Track token usage in session state"""
+    if "usage_stats" not in st.session_state:
+        st.session_state.usage_stats = {
+            "openai": {"input": 0, "output": 0, "requests": 0},
+            "xai": {"input": 0, "output": 0, "requests": 0},
+            "deepseek": {"input": 0, "output": 0, "requests": 0}
+        }
+    
+    if model in st.session_state.usage_stats:
+        st.session_state.usage_stats[model]["input"] += input_tokens
+        st.session_state.usage_stats[model]["output"] += output_tokens
+        st.session_state.usage_stats[model]["requests"] += 1
+
+# ============================================================================
 # SECRETS ACCESS
 # ============================================================================
 
@@ -221,7 +269,7 @@ class DocCrawler:
         self.client.close()
 
 # ============================================================================
-# CHUNKING & EMBEDDING
+# CHUNKING & EMBEDDING (keeping existing implementation)
 # ============================================================================
 
 def create_chunks(pages, progress_callback=None):
@@ -352,10 +400,6 @@ def build_vector_store(chunks, progress_callback=None):
         
         collection.add(ids=ids, documents=documents, metadatas=metadatas)
     return collection
-
-# ============================================================================
-# KNOWLEDGE BASE BUILDER
-# ============================================================================
 
 def build_knowledge_base(force_rebuild=False):
     cache_path = Path(SCRAPE_CACHE_FILE)
@@ -493,149 +537,124 @@ class RAGEngine:
 # LLM PROVIDERS
 # ============================================================================
 
-class HuggingFaceLLM:
-    """
-    Uses HuggingFace Inference API.
-    Note: Free tier models can be slow or unavailable.
-    Uses the Inference API with serverless endpoints.
-    """
+class DeepSeekLLM:
+    """DeepSeek API - Excellent quality at low cost"""
     
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self.base_url = "https://api-inference.huggingface.co/models"
-        # These models are most likely to be available on free tier
-        self.models = [
-            "google/flan-t5-xxl",
-            "bigscience/bloom-560m",
-            "gpt2",
-            "facebook/opt-1.3b",
-        ]
-        self.working_model = None
-        log_info("HuggingFaceLLM initialized")
+        self.model = "deepseek-chat"
+        self.base_url = "https://api.deepseek.com/v1"
+        log_info("DeepSeekLLM initialized")
     
-    def generate(self, messages: List[Dict], temperature: float = 0.3) -> str:
+    def generate(self, messages: List[Dict], temperature: float = 0.3) -> Dict[str, Any]:
+        """Returns dict with 'content' and 'usage' keys"""
         if not self.api_key:
-            return "❌ No HuggingFace API key provided"
-        
-        # Convert messages to a simple prompt
-        prompt = self._messages_to_prompt(messages)
-        
-        # Try working model first
-        if self.working_model:
-            result = self._try_model(self.working_model, prompt, temperature)
-            if result and not result.startswith("❌"):
-                return result
-        
-        # Try each model
-        errors = []
-        for model in self.models:
-            log_info(f"Trying HF model: {model}")
-            result = self._try_model(model, prompt, temperature)
+            return {"content": "❌ No DeepSeek API key provided", "usage": {"input": 0, "output": 0}}
             
-            if result and not result.startswith("❌") and len(result) > 10:
-                self.working_model = model
-                log_info(f"✅ HF model working: {model}")
-                return result
-            else:
-                errors.append(f"{model}: {result[:50] if result else 'No response'}")
-        
-        # All failed - provide helpful message
-        return f"""❌ HuggingFace models unavailable.
-
-**This is normal** - HuggingFace free tier models are often:
-- Loading (cold start takes 20-60 seconds)
-- Rate limited
-- Under heavy load
-
-**Solutions:**
-1. **Wait 30-60 seconds** and try again
-2. **Use OpenAI or xAI** (more reliable)
-3. **Try later** when servers are less busy
-
-Last errors: {'; '.join(errors[:2])}"""
-
-    def _try_model(self, model: str, prompt: str, temperature: float) -> str:
-        url = f"{self.base_url}/{model}"
-        
         try:
-            # Simple text generation request
             response = httpx.post(
-                url,
+                f"{self.base_url}/chat/completions",
                 headers={
                     "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json"
                 },
                 json={
-                    "inputs": prompt,
-                    "parameters": {
-                        "max_new_tokens": 500,
-                        "temperature": temperature,
-                        "do_sample": True,
-                        "return_full_text": False
-                    },
-                    "options": {
-                        "wait_for_model": True
-                    }
+                    "model": self.model,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "max_tokens": 2000
                 },
                 timeout=60.0
             )
             
-            log_debug(f"HF {model} status: {response.status_code}")
-            
             if response.status_code == 200:
-                data = response.json()
+                result = response.json()
+                content = result["choices"][0]["message"]["content"]
+                usage = result.get("usage", {})
                 
-                # Handle different response formats
-                if isinstance(data, list) and len(data) > 0:
-                    if isinstance(data[0], dict):
-                        text = data[0].get("generated_text", "")
-                    else:
-                        text = str(data[0])
-                    if text:
-                        return text.strip()
-                elif isinstance(data, dict):
-                    if "generated_text" in data:
-                        return data["generated_text"].strip()
-                    if "error" in data:
-                        return f"❌ {data['error']}"
-                
-                return "❌ Empty response"
-            
-            elif response.status_code == 503:
-                return "❌ Model loading (503)"
-            elif response.status_code == 429:
-                return "❌ Rate limited (429)"
-            elif response.status_code == 401:
-                return "❌ Invalid API key (401)"
+                return {
+                    "content": content,
+                    "usage": {
+                        "input": usage.get("prompt_tokens", 0),
+                        "output": usage.get("completion_tokens", 0)
+                    }
+                }
             else:
-                return f"❌ HTTP {response.status_code}"
+                return {
+                    "content": f"❌ DeepSeek Error {response.status_code}: {response.text[:200]}",
+                    "usage": {"input": 0, "output": 0}
+                }
                 
-        except httpx.TimeoutException:
-            return "❌ Timeout"
         except Exception as e:
-            return f"❌ {str(e)[:30]}"
-
-    def _messages_to_prompt(self, messages: List[Dict]) -> str:
-        """Convert chat messages to a simple prompt for non-chat models"""
-        parts = []
-        
-        for msg in messages:
-            role = msg["role"]
-            content = msg["content"]
-            
-            if role == "system":
-                parts.append(f"Instructions: {content}\n")
-            elif role == "user":
-                parts.append(f"Question: {content}\n")
-            elif role == "assistant":
-                parts.append(f"Answer: {content}\n")
-        
-        parts.append("Answer:")
-        return "\n".join(parts)
+            return {
+                "content": f"❌ DeepSeek Error: {e}",
+                "usage": {"input": 0, "output": 0}
+            }
 
     def stream(self, messages: List[Dict], temperature: float = 0.3):
-        # HuggingFace free tier doesn't support streaming well
-        yield self.generate(messages, temperature)
+        """Streaming with token tracking"""
+        try:
+            total_content = ""
+            
+            with httpx.stream(
+                "POST",
+                f"{self.base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": self.model,
+                    "messages": messages,
+                    "temperature": temperature,
+                    "stream": True,
+                    "max_tokens": 2000
+                },
+                timeout=60.0
+            ) as response:
+                if response.status_code != 200:
+                    yield {"chunk": f"❌ Error {response.status_code}", "done": True, "usage": {"input": 0, "output": 0}}
+                    return
+                
+                for line in response.iter_lines():
+                    if line.startswith("data: ") and line != "data: [DONE]":
+                        try:
+                            data = json.loads(line[6:])
+                            
+                            # Check for usage info (sent at end)
+                            if "usage" in data:
+                                usage = data["usage"]
+                                yield {
+                                    "chunk": "",
+                                    "done": True,
+                                    "usage": {
+                                        "input": usage.get("prompt_tokens", 0),
+                                        "output": usage.get("completion_tokens", 0)
+                                    }
+                                }
+                                return
+                            
+                            # Get content chunk
+                            delta = data.get("choices", [{}])[0].get("delta", {})
+                            content = delta.get("content", "")
+                            if content:
+                                total_content += content
+                                yield {"chunk": content, "done": False, "usage": None}
+                        except:
+                            continue
+                
+                # Fallback if no usage data received - estimate
+                yield {
+                    "chunk": "",
+                    "done": True,
+                    "usage": {
+                        "input": estimate_tokens(str(messages)),
+                        "output": estimate_tokens(total_content)
+                    }
+                }
+                
+        except Exception as e:
+            yield {"chunk": f"❌ Streaming error: {e}", "done": True, "usage": {"input": 0, "output": 0}}
 
 
 class OpenAILLM:
@@ -644,9 +663,9 @@ class OpenAILLM:
         self.model = "gpt-4o-mini"
         log_info("OpenAILLM initialized")
     
-    def generate(self, messages: List[Dict], temperature: float = 0.3) -> str:
+    def generate(self, messages: List[Dict], temperature: float = 0.3) -> Dict[str, Any]:
         if not self.api_key:
-            return "❌ No OpenAI API key provided"
+            return {"content": "❌ No OpenAI API key provided", "usage": {"input": 0, "output": 0}}
             
         try:
             response = httpx.post(
@@ -666,15 +685,32 @@ class OpenAILLM:
             
             if response.status_code == 200:
                 result = response.json()
-                return result["choices"][0]["message"]["content"]
+                content = result["choices"][0]["message"]["content"]
+                usage = result.get("usage", {})
+                
+                return {
+                    "content": content,
+                    "usage": {
+                        "input": usage.get("prompt_tokens", 0),
+                        "output": usage.get("completion_tokens", 0)
+                    }
+                }
             else:
-                return f"❌ OpenAI Error {response.status_code}: {response.text[:200]}"
+                return {
+                    "content": f"❌ OpenAI Error {response.status_code}: {response.text[:200]}",
+                    "usage": {"input": 0, "output": 0}
+                }
                 
         except Exception as e:
-            return f"❌ OpenAI Error: {e}"
+            return {
+                "content": f"❌ OpenAI Error: {e}",
+                "usage": {"input": 0, "output": 0}
+            }
 
     def stream(self, messages: List[Dict], temperature: float = 0.3):
         try:
+            total_content = ""
+            
             with httpx.stream(
                 "POST",
                 "https://api.openai.com/v1/chat/completions",
@@ -697,24 +733,55 @@ class OpenAILLM:
                             data = json.loads(line[6:])
                             content = data["choices"][0]["delta"].get("content", "")
                             if content:
-                                yield content
+                                total_content += content
+                                yield {"chunk": content, "done": False, "usage": None}
                         except:
                             continue
+                
+                # Estimate usage (OpenAI doesn't send usage in streaming)
+                yield {
+                    "chunk": "",
+                    "done": True,
+                    "usage": {
+                        "input": estimate_tokens(str(messages)),
+                        "output": estimate_tokens(total_content)
+                    }
+                }
         except Exception as e:
-            yield f"❌ Error: {e}"
+            yield {"chunk": f"❌ Error: {e}", "done": True, "usage": {"input": 0, "output": 0}}
 
 
 class XaiLLM:
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self.model = "grok-beta"
+        # Try different model names
+        self.models = ["grok-2-latest", "grok-beta", "grok-2-1212"]
+        self.working_model = None
         self.base_url = "https://api.x.ai/v1"
         log_info("XaiLLM initialized")
 
-    def generate(self, messages: List[Dict], temperature: float = 0.3) -> str:
+    def generate(self, messages: List[Dict], temperature: float = 0.3) -> Dict[str, Any]:
         if not self.api_key:
-            return "❌ No xAI API key provided"
-            
+            return {"content": "❌ No xAI API key provided", "usage": {"input": 0, "output": 0}}
+        
+        # Try working model first
+        if self.working_model:
+            result = self._try_model(self.working_model, messages, temperature)
+            if not result["content"].startswith("❌"):
+                return result
+        
+        # Try all models
+        for model in self.models:
+            log_info(f"Trying xAI model: {model}")
+            result = self._try_model(model, messages, temperature)
+            if not result["content"].startswith("❌"):
+                self.working_model = model
+                log_info(f"xAI working model: {model}")
+                return result
+        
+        return {"content": "❌ All xAI models failed. Check API key or model availability.", "usage": {"input": 0, "output": 0}}
+    
+    def _try_model(self, model: str, messages: List[Dict], temperature: float) -> Dict[str, Any]:
         try:
             response = httpx.post(
                 f"{self.base_url}/chat/completions",
@@ -723,7 +790,7 @@ class XaiLLM:
                     "Content-Type": "application/json"
                 },
                 json={
-                    "model": self.model,
+                    "model": model,
                     "messages": messages,
                     "temperature": temperature,
                     "max_tokens": 2048
@@ -733,15 +800,43 @@ class XaiLLM:
             
             if response.status_code == 200:
                 result = response.json()
-                return result["choices"][0]["message"]["content"]
+                content = result["choices"][0]["message"]["content"]
+                usage = result.get("usage", {})
+                
+                return {
+                    "content": content,
+                    "usage": {
+                        "input": usage.get("prompt_tokens", 0),
+                        "output": usage.get("completion_tokens", 0)
+                    }
+                }
             else:
-                return f"❌ xAI Error {response.status_code}: {response.text[:200]}"
+                return {
+                    "content": f"❌ xAI {model} Error {response.status_code}",
+                    "usage": {"input": 0, "output": 0}
+                }
                 
         except Exception as e:
-            return f"❌ xAI connection error: {e}"
+            return {
+                "content": f"❌ {model} error: {str(e)[:50]}",
+                "usage": {"input": 0, "output": 0}
+            }
 
     def stream(self, messages: List[Dict], temperature: float = 0.3):
+        # Find working model first
+        model_to_use = self.working_model if self.working_model else self.models[0]
+        
+        # If no working model, try to find one
+        if not self.working_model:
+            test_result = self.generate(messages, temperature)
+            if test_result["content"].startswith("❌"):
+                yield {"chunk": test_result["content"], "done": True, "usage": {"input": 0, "output": 0}}
+                return
+            model_to_use = self.working_model
+        
         try:
+            total_content = ""
+            
             with httpx.stream(
                 "POST",
                 f"{self.base_url}/chat/completions",
@@ -750,7 +845,7 @@ class XaiLLM:
                     "Content-Type": "application/json"
                 },
                 json={
-                    "model": self.model,
+                    "model": model_to_use,
                     "messages": messages,
                     "temperature": temperature,
                     "stream": True,
@@ -759,7 +854,7 @@ class XaiLLM:
                 timeout=90.0
             ) as response:
                 if response.status_code != 200:
-                    yield f"❌ xAI Error {response.status_code}"
+                    yield {"chunk": f"❌ xAI Error {response.status_code}", "done": True, "usage": {"input": 0, "output": 0}}
                     return
                     
                 for line in response.iter_lines():
@@ -769,11 +864,23 @@ class XaiLLM:
                             delta = data.get("choices", [{}])[0].get("delta", {})
                             content = delta.get("content", "")
                             if content:
-                                yield content
+                                total_content += content
+                                yield {"chunk": content, "done": False, "usage": None}
                         except:
                             continue
+                
+                # Estimate usage
+                yield {
+                    "chunk": "",
+                    "done": True,
+                    "usage": {
+                        "input": estimate_tokens(str(messages)),
+                        "output": estimate_tokens(total_content)
+                    }
+                }
+                
         except Exception as e:
-            yield f"❌ Streaming error: {e}"
+            yield {"chunk": f"❌ Streaming error: {e}", "done": True, "usage": {"input": 0, "output": 0}}
 
 
 # ============================================================================
@@ -797,9 +904,15 @@ def main():
         st.session_state.last_query = ""
     if "current_model" not in st.session_state:
         st.session_state.current_model = None
+    if "usage_stats" not in st.session_state:
+        st.session_state.usage_stats = {
+            "openai": {"input": 0, "output": 0, "requests": 0},
+            "xai": {"input": 0, "output": 0, "requests": 0},
+            "deepseek": {"input": 0, "output": 0, "requests": 0}
+        }
 
-    # Load secrets ONCE at startup
-    hf_key = get_secret("HUGGINGFACE_API_KEY")
+    # Load secrets
+    deepseek_key = get_secret("DEEPSEEK_API_KEY")
     openai_key = get_secret("OPENAI_API_KEY")
     xai_key = get_secret("XAI_API_KEY")
     model_password = get_secret("MODEL_PASSWORD")
@@ -839,45 +952,44 @@ def main():
         
         st.divider()
         
-        # Model Selection with auto-clear on change
+        # Model Selection
         model_choice = st.selectbox(
             "Model:",
-            ["openai", "xai", "huggingface"],
+            ["deepseek", "openai", "xai"],
             format_func=lambda x: {
-                "huggingface": "🤗 HuggingFace (Free - Unreliable)",
-                "openai": "🧠 GPT-4o-mini (OpenAI) ⭐",
+                "deepseek": "💎 DeepSeek (Cheap & Fast) ⭐",
+                "openai": "🧠 GPT-4o-mini (OpenAI)",
                 "xai": "🚀 Grok (xAI)"
             }[x]
         )
         
-        # Auto-clear chat when model changes
+        # Auto-clear on model change
         if st.session_state.current_model is not None and st.session_state.current_model != model_choice:
             st.session_state.messages = []
             st.session_state.last_query = ""
-            log_info(f"Model changed from {st.session_state.current_model} to {model_choice}, chat cleared")
+            st.toast(f"Switched to {model_choice.upper()} - chat cleared")
         
         st.session_state.current_model = model_choice
         
-        # Authentication handling
+        # Authentication
         api_key = None
         auth_valid = False
         
-        if model_choice == "huggingface":
-            if hf_key:
-                st.success("✅ HuggingFace key loaded")
-                st.caption("⚠️ Note: HF free tier is often slow/unavailable")
-                api_key = hf_key
+        if model_choice == "deepseek":
+            if deepseek_key:
+                st.success("✅ DeepSeek authenticated")
+                api_key = deepseek_key
                 auth_valid = True
             else:
-                manual_key = st.text_input("HuggingFace API Key:", type="password")
+                manual_key = st.text_input("DeepSeek API Key:", type="password", help="Get from platform.deepseek.com")
                 if manual_key:
                     api_key = manual_key
                     auth_valid = True
                 else:
-                    st.warning("⚠️ No HuggingFace key found")
+                    st.warning("⚠️ No DeepSeek key found")
                     
         else:
-            # OpenAI and xAI require password
+            # OpenAI and xAI need password
             pwd = st.text_input("Access Password:", type="password")
             
             if pwd and model_password and pwd == model_password:
@@ -898,6 +1010,33 @@ def main():
 
         st.divider()
         
+        # Usage Stats
+        with st.expander("💰 Usage & Cost", expanded=False):
+            stats = st.session_state.usage_stats
+            
+            total_cost = 0.0
+            for model, data in stats.items():
+                if data["requests"] > 0:
+                    cost = calculate_cost(model, data["input"], data["output"])
+                    total_cost += cost
+                    
+                    st.write(f"**{model.upper()}**")
+                    st.write(f"- Requests: {data['requests']}")
+                    st.write(f"- Input tokens: {data['input']:,}")
+                    st.write(f"- Output tokens: {data['output']:,}")
+                    st.write(f"- Cost: ${cost:.4f}")
+                    st.divider()
+            
+            st.write(f"**Total Cost: ${total_cost:.4f}**")
+            
+            if st.button("Reset Usage Stats"):
+                st.session_state.usage_stats = {
+                    "openai": {"input": 0, "output": 0, "requests": 0},
+                    "xai": {"input": 0, "output": 0, "requests": 0},
+                    "deepseek": {"input": 0, "output": 0, "requests": 0}
+                }
+                st.rerun()
+        
         col1, col2 = st.columns(2)
         with col1:
             if st.button("🗑️ Clear Chat"):
@@ -912,16 +1051,14 @@ def main():
 
         # Debug Panel
         with st.expander("🔧 Debug"):
-            st.write(f"**Secrets loaded:**")
-            st.write(f"- HF: {'✅' if hf_key else '❌'}")
+            st.write("**API Keys:**")
+            st.write(f"- DeepSeek: {'✅' if deepseek_key else '❌'}")
             st.write(f"- OpenAI: {'✅' if openai_key else '❌'}")
             st.write(f"- xAI: {'✅' if xai_key else '❌'}")
-            st.write(f"- Passwords: {'✅' if model_password else '❌'}")
             st.divider()
-            st.write(f"**Current state:**")
-            st.write(f"- Model: {model_choice}")
-            st.write(f"- Auth: {'✅' if auth_valid else '❌'}")
-            st.write(f"- Messages: {len(st.session_state.messages)}")
+            st.write(f"**Model:** {model_choice}")
+            st.write(f"**Auth:** {'✅' if auth_valid else '❌'}")
+            st.write(f"**Messages:** {len(st.session_state.messages)}")
 
         # Admin Tools
         with st.expander("🔐 Admin"):
@@ -945,11 +1082,13 @@ def main():
                 with st.expander(f"📚 Sources ({len(msg['sources'])})"):
                     for s in msg["sources"]:
                         st.markdown(f"- [{s['title']}]({s['url']})")
+            if msg["role"] == "assistant" and "cost" in msg and msg["cost"] > 0:
+                st.caption(f"💰 Cost: ${msg['cost']:.6f}")
 
     # Chat Input
     if prompt := st.chat_input("Ask about D2L Brightspace API..."):
         if prompt == st.session_state.last_query:
-            pass  # Skip duplicate
+            pass
         else:
             st.session_state.last_query = prompt
             
@@ -960,8 +1099,8 @@ def main():
             # Check auth
             if not auth_valid or not api_key:
                 with st.chat_message("assistant"):
-                    if model_choice == "huggingface":
-                        error_msg = "⚠️ HuggingFace API key not configured."
+                    if model_choice == "deepseek":
+                        error_msg = "⚠️ DeepSeek API key not configured."
                     else:
                         error_msg = f"⚠️ Please enter the correct password for {model_choice.upper()}."
                     st.error(error_msg)
@@ -978,12 +1117,12 @@ def main():
                     sources = st.session_state.rag.get_sources(chunks)
                     
                     # Create LLM
-                    if model_choice == "openai":
+                    if model_choice == "deepseek":
+                        llm = DeepSeekLLM(api_key)
+                    elif model_choice == "openai":
                         llm = OpenAILLM(api_key)
-                    elif model_choice == "xai":
-                        llm = XaiLLM(api_key)
                     else:
-                        llm = HuggingFaceLLM(api_key)
+                        llm = XaiLLM(api_key)
                     
                     # Build messages
                     history = [
@@ -992,25 +1131,43 @@ def main():
                     ]
                     messages = st.session_state.rag.build_messages(prompt, chunks, persona, history)
                     
-                    # Generate response
+                    # Generate response with token tracking
                     response_placeholder = st.empty()
                     full_response = ""
+                    input_tokens = 0
+                    output_tokens = 0
                     
                     try:
-                        for chunk in llm.stream(messages):
-                            full_response += chunk
-                            response_placeholder.markdown(full_response + "▌")
+                        for chunk_data in llm.stream(messages):
+                            if chunk_data.get("chunk"):
+                                full_response += chunk_data["chunk"]
+                                response_placeholder.markdown(full_response + "▌")
+                            
+                            if chunk_data.get("done") and chunk_data.get("usage"):
+                                usage = chunk_data["usage"]
+                                input_tokens = usage["input"]
+                                output_tokens = usage["output"]
                         
                         response_placeholder.markdown(full_response)
+                        
+                        # Track usage
+                        track_usage(model_choice, input_tokens, output_tokens)
+                        cost = calculate_cost(model_choice, input_tokens, output_tokens)
+                        
+                        # Show cost
+                        if cost > 0:
+                            st.caption(f"💰 Cost: ${cost:.6f} ({input_tokens:,} in / {output_tokens:,} out)")
                         
                     except Exception as e:
                         full_response = f"❌ Error: {e}"
                         response_placeholder.error(full_response)
+                        cost = 0
                     
                     st.session_state.messages.append({
                         "role": "assistant",
                         "content": full_response,
-                        "sources": sources
+                        "sources": sources,
+                        "cost": cost
                     })
                     
                     if sources:

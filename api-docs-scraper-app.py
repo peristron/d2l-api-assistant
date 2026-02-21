@@ -396,58 +396,116 @@ def create_chunks(pages, progress_callback=None):
     return chunks
 
 def build_vector_store(chunks, progress_callback=None):
+    """Build ChromaDB vector store with proper error handling"""
     chroma_path = Path(CHROMA_DIR)
+    
+    # Clean up existing database
     if chroma_path.exists():
         try:
+            log_info(f"Removing existing database at {chroma_path}")
             shutil.rmtree(chroma_path)
+            time.sleep(1)  # Give filesystem time to sync
         except Exception as e:
-            log_warning(f"Could not delete folder: {e}")
+            log_error(f"Could not delete existing database: {e}")
+            raise
     
-    chroma_path.mkdir(exist_ok=True)
+    # Create fresh directory
+    try:
+        chroma_path.mkdir(parents=True, exist_ok=True)
+        log_info(f"Created database directory at {chroma_path}")
+    except Exception as e:
+        log_error(f"Could not create database directory: {e}")
+        raise
     
-    client = chromadb.PersistentClient(path=CHROMA_DIR)
-    embedding_fn = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
-    collection = client.create_collection(
-        name=COLLECTION_NAME,
-        embedding_function=embedding_fn
-    )
+    # Initialize ChromaDB
+    try:
+        client = chromadb.PersistentClient(path=str(chroma_path))
+        embedding_fn = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+        
+        # Check if collection exists and delete it
+        try:
+            existing_collection = client.get_collection(name=COLLECTION_NAME)
+            client.delete_collection(name=COLLECTION_NAME)
+            log_info(f"Deleted existing collection: {COLLECTION_NAME}")
+        except Exception:
+            pass  # Collection doesn't exist, which is fine
+        
+        # Create new collection
+        collection = client.create_collection(
+            name=COLLECTION_NAME,
+            embedding_function=embedding_fn,
+            metadata={"hnsw:space": "cosine"}
+        )
+        log_info(f"Created new collection: {COLLECTION_NAME}")
+        
+    except Exception as e:
+        log_error(f"ChromaDB initialization error: {e}")
+        raise
     
+    # Add chunks in batches
     batch_size = 50
     total_batches = (len(chunks) + batch_size - 1) // batch_size
     
     for i in range(0, len(chunks), batch_size):
         batch = chunks[i:i + batch_size]
+        batch_num = i // batch_size + 1
+        
         if progress_callback:
-            progress_callback(i // batch_size + 1, total_batches)
+            progress_callback(batch_num, total_batches)
         
-        ids = [c.chunk_id for c in batch]
-        documents = [c.content for c in batch]
-        metadatas = []
-        for c in batch:
-            meta = {}
-            for k, v in c.metadata.items():
-                meta[k] = str(v) if not isinstance(v, (str, int, float, bool)) else v
-            metadatas.append(meta)
-        
-        collection.add(ids=ids, documents=documents, metadatas=metadatas)
+        try:
+            ids = [c.chunk_id for c in batch]
+            documents = [c.content for c in batch]
+            metadatas = []
+            
+            for c in batch:
+                meta = {}
+                for k, v in c.metadata.items():
+                    meta[k] = str(v) if not isinstance(v, (str, int, float, bool)) else v
+                metadatas.append(meta)
+            
+            collection.add(ids=ids, documents=documents, metadatas=metadatas)
+            log_debug(f"Added batch {batch_num}/{total_batches} ({len(batch)} chunks)")
+            
+        except Exception as e:
+            log_error(f"Error adding batch {batch_num}: {e}")
+            raise
+    
+    # Verify collection
+    final_count = collection.count()
+    log_info(f"Vector store built with {final_count} chunks")
+    
+    if final_count == 0:
+        raise Exception("Vector store is empty after building!")
+    
     return collection
 
 def build_knowledge_base(force_rebuild=False):
+    """Build or load knowledge base with comprehensive error handling"""
     cache_path = Path(SCRAPE_CACHE_FILE)
     chroma_path = Path(CHROMA_DIR)
     
+    # Try loading existing KB
     if not force_rebuild and chroma_path.exists() and cache_path.exists():
         try:
-            log_info("Loading existing KB...")
+            log_info("Attempting to load existing knowledge base...")
             metadata = json.loads(cache_path.read_text())
+            
             client = chromadb.PersistentClient(path=str(chroma_path))
             embedding_fn = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
             collection = client.get_collection(name=COLLECTION_NAME, embedding_function=embedding_fn)
-            if collection.count() > 0:
-                return True, f"Loaded {collection.count()} chunks.", metadata
+            
+            count = collection.count()
+            if count > 0:
+                log_info(f"Loaded existing KB with {count} chunks")
+                return True, f"Loaded {count} chunks from cache.", metadata
+            else:
+                log_warning("Existing KB is empty, rebuilding...")
+                
         except Exception as e:
-            log_warning(f"Load failed ({e}), rebuilding...")
+            log_warning(f"Failed to load existing KB ({e}), rebuilding...")
     
+    # Build new KB
     status_placeholder = st.empty()
     progress_bar = st.progress(0)
     log_container = st.expander("📋 Build Logs", expanded=True)
@@ -458,53 +516,96 @@ def build_knowledge_base(force_rebuild=False):
         log_info(msg)
     
     try:
-        log("Starting clean build...")
+        log("Starting knowledge base build...")
         gc.collect()
+        
+        # Clean up old files
         if chroma_path.exists():
+            log("Removing old database...")
             shutil.rmtree(chroma_path, ignore_errors=True)
+            time.sleep(1)
+            
         if cache_path.exists():
+            log("Removing old metadata...")
             cache_path.unlink()
         
+        # Step 1: Crawl
         status_placeholder.info("📥 Step 1/3: Crawling Documentation...")
+        log("Initializing crawler...")
         crawler = DocCrawler()
-        pages = crawler.crawl_all(
-            max_pages=MAX_PAGES, 
-            progress_callback=lambda c, u: progress_bar.progress(min(c / MAX_PAGES * 0.33, 0.33))
-        )
+        
+        def crawl_progress(count, url):
+            progress = min(count / MAX_PAGES * 0.33, 0.33)
+            progress_bar.progress(progress)
+            log(f"[{count}/{MAX_PAGES}] {url[:60]}...")
+        
+        pages = crawler.crawl_all(max_pages=MAX_PAGES, progress_callback=crawl_progress)
         crawler.close()
         
         if not pages:
-            raise Exception("No pages found.")
-
+            raise Exception("Crawler returned no pages. Check network connectivity.")
+        
+        log(f"Crawled {len(pages)} pages successfully")
+        
+        # Step 2: Chunk
         status_placeholder.info("✂️ Step 2/3: Chunking content...")
-        chunks = create_chunks(
-            pages,
-            progress_callback=lambda c, t: progress_bar.progress(0.33 + (c / t * 0.33))
-        )
-
-        status_placeholder.info("🧠 Step 3/3: Embedding vectors...")
-        collection = build_vector_store(
-            chunks,
-            progress_callback=lambda b, t: progress_bar.progress(0.66 + (b / t * 0.34))
-        )
+        log("Creating chunks...")
+        
+        def chunk_progress(current, total):
+            progress = 0.33 + (current / total * 0.33)
+            progress_bar.progress(progress)
+        
+        chunks = create_chunks(pages, progress_callback=chunk_progress)
+        
+        if not chunks:
+            raise Exception("Chunking produced no results.")
+        
+        log(f"Created {len(chunks)} chunks")
+        
+        # Step 3: Embed
+        status_placeholder.info("🧠 Step 3/3: Building vector database...")
+        log("Initializing vector store...")
+        
+        def embed_progress(batch, total):
+            progress = 0.66 + (batch / total * 0.34)
+            progress_bar.progress(min(progress, 1.0))
+        
+        collection = build_vector_store(chunks, progress_callback=embed_progress)
         final_count = collection.count()
         
+        if final_count == 0:
+            raise Exception("Vector store built but contains no vectors!")
+        
+        log(f"Vector store ready with {final_count} vectors")
+        
+        # Save metadata
         metadata = {
             "scraped_at": datetime.utcnow().isoformat(),
             "pages_count": len(pages),
             "chunks_count": len(chunks),
             "vectors_count": final_count,
         }
+        
         cache_path.write_text(json.dumps(metadata, indent=2))
+        log("Metadata saved")
         
         progress_bar.progress(1.0)
-        status_placeholder.success("✅ Knowledge base built successfully!")
-        return True, "Success", metadata
-
+        status_placeholder.success(f"✅ Knowledge base built successfully! ({final_count} vectors)")
+        
+        return True, f"Built {final_count} vectors", metadata
+        
     except Exception as e:
-        status_placeholder.error(f"Build failed: {e}")
-        log_error(f"Build failed: {e}")
-        return False, str(e), {}
+        error_msg = f"Build failed: {str(e)}"
+        log_error(error_msg)
+        status_placeholder.error(f"❌ {error_msg}")
+        
+        # Clean up partial build
+        if chroma_path.exists():
+            shutil.rmtree(chroma_path, ignore_errors=True)
+        if cache_path.exists():
+            cache_path.unlink()
+        
+        return False, error_msg, {}
 
 # ============================================================================
 # RAG ENGINE
@@ -512,14 +613,27 @@ def build_knowledge_base(force_rebuild=False):
 
 class RAGEngine:
     def __init__(self):
-        self.client = chromadb.PersistentClient(path=CHROMA_DIR)
-        self.embedding_fn = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
-        self.collection = self.client.get_collection(
-            name=COLLECTION_NAME,
-            embedding_function=self.embedding_fn
-        )
+        """Initialize RAG engine with error handling"""
+        try:
+            self.client = chromadb.PersistentClient(path=CHROMA_DIR)
+            self.embedding_fn = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+            self.collection = self.client.get_collection(
+                name=COLLECTION_NAME,
+                embedding_function=self.embedding_fn
+            )
+            
+            count = self.collection.count()
+            if count == 0:
+                raise Exception("Collection is empty!")
+            
+            log_info(f"RAG Engine initialized with {count} vectors")
+            
+        except Exception as e:
+            log_error(f"Failed to initialize RAG engine: {e}")
+            raise
     
     def retrieve(self, query, n_results=5):
+        """Retrieve relevant chunks with error handling"""
         log_debug(f"Retrieving documents for query: {query[:50]}...")
         try:
             results = self.collection.query(
@@ -527,6 +641,7 @@ class RAGEngine:
                 n_results=n_results,
                 include=["documents", "metadatas", "distances"]
             )
+            
             chunks = []
             if results["documents"] and results["documents"][0]:
                 for i, doc in enumerate(results["documents"][0]):
@@ -535,13 +650,16 @@ class RAGEngine:
                         "metadata": results["metadatas"][0][i],
                         "relevance": 1 - results["distances"][0][i]
                     })
+            
             log_debug(f"Retrieved {len(chunks)} chunks")
             return chunks
+            
         except Exception as e:
             log_error(f"Retrieval error: {e}")
             return []
 
     def build_messages(self, query, chunks, persona, history=None):
+        """Build message array for LLM"""
         system_prompt = DEVELOPER_PROMPT if persona == "developer" else PLAIN_PROMPT
         context_text = "\n\n".join([f"--- Source {i+1} ---\n{c['content']}" for i, c in enumerate(chunks)])
         
@@ -554,6 +672,7 @@ class RAGEngine:
         return messages
 
     def get_sources(self, chunks):
+        """Extract unique sources from chunks"""
         sources = []
         seen = set()
         for c in chunks:
@@ -955,20 +1074,38 @@ def main():
 
     # Initialize Knowledge Base
     if not st.session_state.kb_ready:
-        st.info("🔍 Checking knowledge base...")
-        success, msg, metadata = build_knowledge_base(force_rebuild=False)
-        st.session_state.kb_ready = success
-        st.session_state.kb_metadata = metadata
-        if not success:
-            if st.button("🔄 Try Rebuilding"):
-                build_knowledge_base(force_rebuild=True)
+        st.info("🔍 Initializing knowledge base...")
+        
+        try:
+            success, msg, metadata = build_knowledge_base(force_rebuild=False)
+            st.session_state.kb_ready = success
+            st.session_state.kb_metadata = metadata
+            
+            if not success:
+                st.error(f"❌ Knowledge base initialization failed: {msg}")
+                if st.button("🔄 Try Rebuilding"):
+                    st.session_state.kb_ready = False
+                    if "rag" in st.session_state:
+                        del st.session_state.rag
+                    st.rerun()
+                st.stop()
+            
+            st.rerun()
+            
+        except Exception as e:
+            st.error(f"❌ Fatal error initializing KB: {e}")
+            if st.button("🔄 Retry"):
                 st.rerun()
             st.stop()
-        st.rerun()
 
     # Init RAG
     if "rag" not in st.session_state:
-        st.session_state.rag = RAGEngine()
+        try:
+            st.session_state.rag = RAGEngine()
+        except Exception as e:
+            st.error(f"❌ Failed to initialize RAG engine: {e}")
+            st.info("Try clicking 'Refresh DB' in the Admin section")
+            st.stop()
 
     # Sidebar
     with st.sidebar:
@@ -978,11 +1115,13 @@ def main():
         if st.session_state.kb_metadata:
             pages = st.session_state.kb_metadata.get('pages_count', '?')
             chunks = st.session_state.kb_metadata.get('chunks_count', '?')
-            st.success(f"KB: {pages} pages / {chunks} chunks")
+            vectors = st.session_state.kb_metadata.get('vectors_count', '?')
+            st.success(f"✅ KB Ready")
+            st.caption(f"{pages} pages → {chunks} chunks → {vectors} vectors")
             
             # Coverage tracking
             st.divider()
-            st.subheader("📊 Scraping Coverage")
+            st.subheader("📊 Coverage")
             
             quality = check_scraping_quality()
             
@@ -1002,16 +1141,8 @@ def main():
                     st.write(f"**Expected Routes:** {quality['baseline_routes']}")
                     st.caption(f"Baseline: {quality['baseline_date'][:10]}")
             else:
-                with st.expander("No baseline yet"):
-                    st.info("""
-                    **To track coverage:**
-                    1. Run the [Validator App](https://docsscraper-tester-validator.streamlit.app/)
-                    2. Click "Start Full Audit"
-                    3. Go to "Export" tab
-                    4. Click "Save All Reports"
-                    5. Download `expected_coverage.json`
-                    6. Upload to this app's GitHub repo
-                    """)
+                with st.expander("No baseline"):
+                    st.info("Upload `expected_coverage.json` to track coverage")
 
         persona = st.radio(
             "Response Style:",
@@ -1127,6 +1258,10 @@ def main():
             st.write(f"**Model:** {model_choice}")
             st.write(f"**Auth:** {'✅' if auth_valid else '❌'}")
             st.write(f"**Messages:** {len(st.session_state.messages)}")
+            st.write(f"**KB Ready:** {'✅' if st.session_state.kb_ready else '❌'}")
+            
+            if st.session_state.kb_metadata:
+                st.write(f"**Vectors:** {st.session_state.kb_metadata.get('vectors_count', 0)}")
 
         # Admin Tools
         with st.expander("🔐 Admin"):
@@ -1135,9 +1270,9 @@ def main():
             if st.button("🔄 Refresh DB"):
                 if admin_input and admin_password and admin_input == admin_password:
                     st.session_state.kb_ready = False
+                    st.session_state.kb_metadata = {}
                     if "rag" in st.session_state:
                         del st.session_state.rag
-                    build_knowledge_base(force_rebuild=True)
                     st.rerun()
                 else:
                     st.error("Invalid admin password")
@@ -1168,7 +1303,7 @@ def main():
             if not auth_valid or not api_key:
                 with st.chat_message("assistant"):
                     if model_choice == "deepseek":
-                        error_msg = "⚠️ DeepSeek API key not configured."
+                        error_msg = "⚠️ DeepSeek API key not configured. Get one free at https://platform.deepseek.com"
                     else:
                         error_msg = f"⚠️ Please enter the correct password for {model_choice.upper()}."
                     st.error(error_msg)
